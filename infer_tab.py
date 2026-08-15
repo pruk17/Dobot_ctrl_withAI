@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 infer_tab.py
--------------
-โหมดที่ 2: การใช้งานโมเดล (Model Deployment & Inference) + การสื่อสารกับแขนหุ่นยนต์ผ่าน TCP/IP
+------------
+Mode 2: run a trained model against the webcam and talk to the robot over TCP/IP.
 
-คุณสมบัติตามข้อกำหนด:
-  - โหลดโมเดลที่ผ่านการฝึกสอน (Trained Model) มาใช้งานร่วมกับกล้อง Webcam
-  - แสดงภาพจากกล้อง Webcam แบบ Real-time
-  - ปุ่มเริ่มการตรวจจับ (Detect: S) -> จับภาพ, ประมวลผล (Inference), นับจำนวนวัตถุแต่ละคลาส
-  - ส่งผลตรวจจับไปยังหุ่นยนต์ผ่าน TCP/IP รูปแบบ "circle,3,square,2" หรือ "none"
-  - หลังส่งผลแล้วเข้าสถานะรอ (Wait State) รอรับ "Done" จากหุ่นยนต์ก่อนพร้อมตรวจจับรอบถัดไป
-  - เป็น TCP Client เชื่อมต่อ Dobot MG400 (TCP Server), กำหนด IP/Port ได้
-  - ตอนเชื่อมต่อสำเร็จ ส่ง "Ready" และรอ "ACK" (ครั้งเดียวตอนเริ่มต้น)
-  - แสดงประวัติการรับ-ส่งข้อมูล (Communication Log)
+  - load a trained model (.pt) and show the webcam live
+  - "S" (or the button) grabs the current frame, runs inference and counts the
+    objects of every class
+  - the result is sent to the robot as "circle,3,square,2", or "none"
+  - afterwards the program stays in a wait state until the robot answers "Done"
+
+The wait state can time out. When that happens the program deliberately stays in the
+wait state instead of unlocking itself, because a late "Done" would otherwise be read
+as the answer to the next detection. The operator clears it with the cancel button.
 """
 
 import os
-import time
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -28,6 +28,11 @@ import camera_utils
 import ui_theme
 from tcp_client import RobotClient
 
+RIGHT_COLUMN_WIDTH = 560
+
+# Widget classes where a keystroke means "the user is typing", not "start detection".
+TEXT_INPUT_WIDGETS = (tk.Entry, tk.Text, tk.Spinbox, tk.Listbox, ttk.Entry, ttk.Combobox, ttk.Spinbox)
+
 
 class InferTab(ttk.Frame):
     def __init__(self, master):
@@ -37,126 +42,175 @@ class InferTab(ttk.Frame):
         self.preview_running = False
         self.model = None
         self.model_path = None
-        self.robot = RobotClient(log_callback=self._log_threadsafe, status_callback=self._on_status_change)
-        self.state = "idle"  # idle | connected | ready | waiting_done
+        self.state = "disconnected"  # disconnected | connected | ready | waiting_done | wait_timeout
         self._last_frame = None
 
+        self.robot = RobotClient(
+            log_callback=self._log_threadsafe,
+            status_callback=self._on_status_change,
+            ack_timeout=5.0,
+            done_timeout=180.0,
+            ready_retries=5,
+        )
+
         self._build_ui()
-        self.bind_all("s", self._on_key_s)  # ปุ่มลัด "S" สำหรับเริ่มการตรวจจับ (Start Detection)
 
-    # ---------------------------------------------------------------- UI ---
+        # Both cases of the shortcut key are bound: with Caps Lock on, or with Shift
+        # held, Tk reports "S" and a lowercase-only binding would never fire.
+        self.bind_all("<KeyPress-s>", self._on_detect_key)
+        self.bind_all("<KeyPress-S>", self._on_detect_key)
+
+    # ----------------------------------------------------------------- UI ---
     def _build_ui(self):
+        hint = ttk.Label(
+            self,
+            text=(
+                "หากไม่มีหุ่นยนต์จริงสำหรับทดสอบ ใช้โปรแกรมจำลอง TCP Server เช่น Hercules หรือ "
+                "mock_robot_server.py ที่แนบมาให้ (ต้องตอบ 'ACK' หลังรับ 'Ready' และตอบ 'Done' หลังรับผลตรวจจับ)"
+            ),
+            style="Sub.TLabel", wraplength=1400,
+        )
+        hint.pack(side="bottom", anchor="w", padx=18, pady=(0, 8))
+
         top = ttk.Frame(self)
-        top.pack(fill="both", expand=True, padx=8, pady=8)
+        top.pack(side="top", fill="both", expand=True, padx=8, pady=8)
 
-        left = ttk.LabelFrame(top, text="🧠  โมเดล  &  กล้อง Webcam (Real-time)")
+        left = ttk.LabelFrame(top, text="โมเดล และกล้อง Webcam (Real-time)")
         left.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self._build_vision_panel(left)
 
+        right = ttk.LabelFrame(top, text="การสื่อสารกับแขนหุ่นยนต์ (TCP/IP Socket)", width=RIGHT_COLUMN_WIDTH)
+        right.pack(side="left", fill="y")
+        right.pack_propagate(False)
+        self._build_tcp_panel(right)
+
+    def _build_vision_panel(self, left):
+        # --- top anchored -------------------------------------------------
         model_row = ttk.Frame(left)
-        model_row.pack(fill="x", padx=10, pady=(10, 6))
-        ttk.Button(model_row, text="📂  โหลดโมเดล (.pt)", style="Accent.TButton", command=self.load_model).pack(
+        model_row.pack(side="top", fill="x", padx=10, pady=(10, 6))
+        ttk.Button(model_row, text="โหลดโมเดล (.pt)", style="Accent.TButton", command=self.load_model).pack(
             side="left"
         )
         self.model_label_var = tk.StringVar(value="ยังไม่ได้โหลดโมเดล")
         ttk.Label(model_row, textvariable=self.model_label_var, style="Sub.TLabel").pack(side="left", padx=10)
 
         cam_select_row = ttk.Frame(left)
-        cam_select_row.pack(fill="x", padx=10, pady=(0, 6))
+        cam_select_row.pack(side="top", fill="x", padx=10, pady=(0, 6))
         ttk.Label(cam_select_row, text="เลือกกล้อง:").pack(side="left")
         self.camera_index_var = tk.StringVar(value="0")
         self.camera_combo = ttk.Combobox(
             cam_select_row, textvariable=self.camera_index_var, state="readonly", width=6, values=["0"]
         )
         self.camera_combo.pack(side="left", padx=6)
-        ttk.Button(cam_select_row, text="🔍 ค้นหากล้อง", command=self.refresh_cameras).pack(side="left", padx=4)
+        ttk.Button(cam_select_row, text="ค้นหากล้อง", command=self.refresh_cameras).pack(side="left", padx=4)
 
-        preview_card = tk.Frame(left, bg=ui_theme.BORDER, padx=1, pady=1)
-        preview_card.pack(padx=10, pady=(0, 8))
-        self.preview_label = tk.Label(preview_card, bg="#0c0f16")
-        self.preview_label.pack()
+        # --- bottom anchored, packed in reverse visual order ---------------
+        self.result_var = tk.StringVar(value="ผลการตรวจจับล่าสุด: -")
+        result_card = tk.Frame(
+            left, bg=ui_theme.CARD_BG, highlightthickness=1, highlightbackground=ui_theme.BORDER
+        )
+        result_card.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        tk.Label(
+            result_card, textvariable=self.result_var, font=ui_theme.FONT_STATUS,
+            bg=ui_theme.CARD_BG, fg=ui_theme.ACCENT_DARK, anchor="w", justify="left",
+        ).pack(anchor="w", padx=10, pady=8)
+
+        self.detect_btn = ttk.Button(
+            left, text="เริ่มการตรวจจับ (Detect: S)", style="Accent.TButton",
+            command=self.on_detect_pressed, state="disabled"
+        )
+        self.detect_btn.pack(side="bottom", fill="x", padx=10, pady=(4, 8))
+
+        conf_row = ttk.Frame(left)
+        conf_row.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
+        ttk.Label(conf_row, text="Confidence threshold:").pack(side="left")
+        self.conf_var = tk.DoubleVar(value=0.5)
+        ttk.Spinbox(
+            conf_row, from_=0.05, to=0.95, increment=0.05, textvariable=self.conf_var, width=6
+        ).pack(side="left", padx=6)
 
         cam_btns = ttk.Frame(left)
-        cam_btns.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Button(cam_btns, text="▶  เปิดกล้อง", style="Accent.TButton", command=self.start_preview).pack(
+        cam_btns.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        ttk.Button(cam_btns, text="เปิดกล้อง", style="Accent.TButton", command=self.start_preview).pack(
             side="left", expand=True, fill="x", padx=(0, 4)
         )
-        ttk.Button(cam_btns, text="⏹  ปิดกล้อง", command=self.stop_preview).pack(
+        ttk.Button(cam_btns, text="ปิดกล้อง", command=self.stop_preview).pack(
             side="left", expand=True, fill="x", padx=(4, 0)
         )
 
-        conf_row = ttk.Frame(left)
-        conf_row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(conf_row, text="Confidence threshold:").pack(side="left")
-        self.conf_var = tk.DoubleVar(value=0.5)
-        ttk.Spinbox(conf_row, from_=0.05, to=0.95, increment=0.05, textvariable=self.conf_var, width=6).pack(
-            side="left", padx=6
-        )
+        # --- fills whatever space is left ---------------------------------
+        # Requested height is the preferred size; pack gives it that plus any spare
+        # space, and shrinks it first when the window is too small, so the detect
+        # button and the result card can never be pushed off screen.
+        self.preview_frame = tk.Frame(left, bg=ui_theme.BORDER, height=320)
+        self.preview_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+        self.preview_frame.pack_propagate(False)
+        self.preview_label = tk.Label(self.preview_frame, bg="#0c0f16")
+        self.preview_label.pack(fill="both", expand=True)
 
-        self.detect_btn = ttk.Button(
-            left, text="🎯  เริ่มการตรวจจับ  (Detect: S)", style="Accent.TButton",
-            command=self.on_detect_pressed, state="disabled"
-        )
-        self.detect_btn.pack(fill="x", padx=10, pady=(4, 8))
-
-        self.result_var = tk.StringVar(value="ผลการตรวจจับล่าสุด: -")
-        result_card = tk.Frame(left, bg=ui_theme.CARD_BG, highlightthickness=1, highlightbackground=ui_theme.BORDER)
-        result_card.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Label(
-            result_card, textvariable=self.result_var, font=ui_theme.FONT_STATUS,
-            background=ui_theme.CARD_BG, foreground=ui_theme.ACCENT_DARK
-        ).pack(anchor="w", padx=10, pady=8)
-
-        # ------------------------------------------------------------ right: TCP/IP
-        right = ttk.LabelFrame(top, text="🤖  การสื่อสารกับแขนหุ่นยนต์  (TCP/IP Socket)")
-        right.pack(side="left", fill="both", expand=True)
-
+    def _build_tcp_panel(self, right):
         conn_row = ttk.Frame(right)
-        conn_row.pack(fill="x", padx=10, pady=10)
+        conn_row.pack(side="top", fill="x", padx=10, pady=(10, 4))
         ttk.Label(conn_row, text="IP Address:").grid(row=0, column=0, sticky="w")
         self.ip_var = tk.StringVar(value="192.168.1.6")
         ttk.Entry(conn_row, textvariable=self.ip_var, width=16).grid(row=0, column=1, padx=6)
-
         ttk.Label(conn_row, text="Port:").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        # 29999 matches mock_robot_server.py for local testing. On the real MG400 this
+        # must be the port of the TCP server written in the robot program - 29999 is the
+        # Dobot dashboard port and will never answer "ACK".
         self.port_var = tk.StringVar(value="29999")
         ttk.Entry(conn_row, textvariable=self.port_var, width=8).grid(row=0, column=3, padx=6)
 
+        btn_row = ttk.Frame(right)
+        btn_row.pack(side="top", fill="x", padx=10, pady=(0, 6))
         self.connect_btn = ttk.Button(
-            conn_row, text="🔌  เชื่อมต่อ", style="Accent.TButton", command=self.connect_robot
+            btn_row, text="เชื่อมต่อ", style="Accent.TButton", command=self.connect_robot
         )
-        self.connect_btn.grid(row=0, column=4, padx=(12, 4))
-        ttk.Button(conn_row, text="❌  ตัดการเชื่อมต่อ", style="Danger.TButton", command=self.disconnect_robot).grid(
-            row=0, column=5, padx=4
+        self.connect_btn.pack(side="left")
+        ttk.Button(btn_row, text="ตัดการเชื่อมต่อ", style="Danger.TButton", command=self.disconnect_robot).pack(
+            side="left", padx=6
         )
 
-        status_card = tk.Frame(right, bg=ui_theme.CARD_BG, highlightthickness=1, highlightbackground=ui_theme.BORDER)
-        status_card.pack(fill="x", padx=10, pady=(0, 10))
+        timeout_row = ttk.Frame(right)
+        timeout_row.pack(side="top", fill="x", padx=10, pady=(0, 8))
+        ttk.Label(timeout_row, text="รอ Done ไม่เกิน (วินาที):").pack(side="left")
+        self.done_timeout_var = tk.IntVar(value=180)
+        ttk.Spinbox(
+            timeout_row, from_=10, to=900, increment=10, textvariable=self.done_timeout_var, width=6,
+            command=self._apply_done_timeout,
+        ).pack(side="left", padx=6)
+        ttk.Label(
+            timeout_row, text="ตั้งให้นานกว่าเวลาที่หุ่นจัดวางจริง", style="Sub.TLabel"
+        ).pack(side="left", padx=4)
+
+        status_card = tk.Frame(
+            right, bg=ui_theme.CARD_BG, highlightthickness=1, highlightbackground=ui_theme.BORDER
+        )
+        status_card.pack(side="top", fill="x", padx=10, pady=(0, 6))
         self.status_dot = tk.Canvas(status_card, width=14, height=14, bg=ui_theme.CARD_BG, highlightthickness=0)
-        self.status_dot.pack(side="left", padx=(10, 4), pady=8)
+        self.status_dot.pack(side="left", padx=(10, 6), pady=8)
         self._status_dot_id = self.status_dot.create_oval(2, 2, 12, 12, fill=ui_theme.NEUTRAL, outline="")
         self.status_var = tk.StringVar(value="สถานะ: ยังไม่ได้เชื่อมต่อ")
         self.status_label = tk.Label(
             status_card, textvariable=self.status_var, font=ui_theme.FONT_STATUS,
-            bg=ui_theme.CARD_BG, fg=ui_theme.NEUTRAL
+            bg=ui_theme.CARD_BG, fg=ui_theme.NEUTRAL, anchor="w", justify="left", wraplength=460,
         )
         self.status_label.pack(side="left", padx=(0, 10), pady=8)
 
-        ttk.Label(right, text="ประวัติการรับ-ส่งข้อมูล (Communication Log):").pack(anchor="w", padx=10)
-        self.log_text = tk.Text(right, height=26, wrap="word")
-        ui_theme.style_log_text(self.log_text)
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-
-        hint = ttk.Label(
-            self,
-            text=(
-                "💡 หากไม่มีหุ่นยนต์จริงสำหรับทดสอบ สามารถใช้โปรแกรมจำลอง TCP Server เช่น Hercules หรือ "
-                "mock_robot_server.py ที่แนบมาให้ เพื่อจำลองการรับ-ส่งข้อมูล "
-                "(ต้องตอบ 'ACK' หลังรับ 'Ready' และตอบ 'Done' หลังรับผลตรวจจับ)"
-            ),
-            style="Sub.TLabel", wraplength=1500,
+        self.cancel_wait_btn = ttk.Button(
+            right, text="ยกเลิกการรอ Done และกลับสู่สถานะพร้อม", style="Warn.TButton",
+            command=self.cancel_wait, state="disabled"
         )
-        hint.pack(anchor="w", padx=18, pady=(0, 10))
+        self.cancel_wait_btn.pack(side="top", fill="x", padx=10, pady=(0, 8))
 
-    # ------------------------------------------------------------- model ---
+        ttk.Label(right, text="ประวัติการรับ-ส่งข้อมูล (Communication Log):").pack(
+            side="top", anchor="w", padx=10
+        )
+        self.log_text = tk.Text(right, height=10, wrap="word")
+        ui_theme.style_log_text(self.log_text)
+        self.log_text.pack(side="top", fill="both", expand=True, padx=10, pady=(4, 10))
+
+    # -------------------------------------------------------------- model ---
     def load_model(self):
         path = filedialog.askopenfilename(
             title="เลือกไฟล์โมเดลที่ฝึกสอนแล้ว (.pt)",
@@ -175,20 +229,26 @@ class InferTab(ttk.Frame):
             self.model_path = path
             self.model_label_var.set(f"โมเดล: {os.path.basename(path)}")
             self._log(f"[SYS] โหลดโมเดลสำเร็จ: {path}")
-            self._update_detect_btn_state()
+            self._update_button_states()
         except Exception as e:
             messagebox.showerror("ผิดพลาด", f"โหลดโมเดลไม่สำเร็จ: {e}")
 
-    # ------------------------------------------------------------ camera ---
+    # ------------------------------------------------------------- camera ---
     def refresh_cameras(self):
-        self._log("[SYS] กำลังค้นหากล้องที่เชื่อมต่อ ...")
+        self._log("[SYS] กำลังค้นหากล้องที่เชื่อมต่อ ... (ใช้เวลาราว 10-30 วินาที)")
+        self.update_idletasks()
         found = camera_utils.list_available_cameras()
         if not found:
-            messagebox.showwarning("แจ้งเตือน", "ไม่พบกล้องที่เชื่อมต่ออยู่")
+            messagebox.showwarning(
+                "แจ้งเตือน",
+                "ไม่พบกล้องที่เชื่อมต่ออยู่\n\n"
+                "ถ้ามีโปรแกรมอื่นเปิดกล้องค้างไว้ (รวมถึงแท็บ Training) จะสแกนไม่เจอ "
+                "ให้กดปิดกล้องก่อนแล้วลองใหม่",
+            )
             return
         values = [str(i) for i in found]
         self.camera_combo["values"] = values
-        # เลือก index สูงสุดที่พบให้อัตโนมัติ เพราะมักจะเป็นกล้อง USB ภายนอก (ไม่ใช่ built-in index 0)
+        # Highest index first: that is usually the external USB camera, which the rules require.
         self.camera_index_var.set(values[-1])
         self._log(f"[SYS] พบกล้อง index: {values} (เลือก {values[-1]} ให้อัตโนมัติ)")
 
@@ -211,6 +271,7 @@ class InferTab(ttk.Frame):
             self.cap.release()
             self.cap = None
         self.preview_label.configure(image="")
+        self.preview_label.imgtk = None
 
     def _update_preview(self):
         if not self.preview_running or self.cap is None:
@@ -219,13 +280,22 @@ class InferTab(ttk.Frame):
         if ok:
             self._last_frame = frame
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb).resize((880, 660))
-            imgtk = ImageTk.PhotoImage(image=img)
+            h, w = rgb.shape[:2]
+            size = ui_theme.fit_size(
+                w, h, self.preview_frame.winfo_width(), self.preview_frame.winfo_height()
+            )
+            imgtk = ImageTk.PhotoImage(image=Image.fromarray(rgb).resize(size))
             self.preview_label.imgtk = imgtk
             self.preview_label.configure(image=imgtk)
         self.after(30, self._update_preview)
 
-    # ---------------------------------------------------------------- TCP ---
+    # ----------------------------------------------------------------- TCP ---
+    def _apply_done_timeout(self):
+        try:
+            self.robot.done_timeout = float(self.done_timeout_var.get())
+        except (ValueError, tk.TclError):
+            pass
+
     def connect_robot(self):
         ip = self.ip_var.get().strip()
         port = self.port_var.get().strip()
@@ -233,52 +303,63 @@ class InferTab(ttk.Frame):
             messagebox.showwarning("แจ้งเตือน", "กรุณากรอก IP Address และ Port")
             return
 
+        self._apply_done_timeout()
+        self.connect_btn.configure(state="disabled")
+
         def worker():
             ok, msg = self.robot.connect(ip, port)
             self.after(0, lambda: self._after_connect(ok, msg))
 
-        import threading
-
         threading.Thread(target=worker, daemon=True).start()
 
     def _after_connect(self, ok, msg):
+        self.connect_btn.configure(state="normal")
         if not ok:
             messagebox.showerror("เชื่อมต่อไม่สำเร็จ", msg)
-        self._update_detect_btn_state()
+        self._update_button_states()
 
     def disconnect_robot(self):
         self.robot.close()
-        self._update_detect_btn_state()
+        self._update_button_states()
+
+    def cancel_wait(self):
+        """Operator override after a Done timeout: drop anything still queued on the
+        socket and go back to the ready state."""
+        self.cancel_wait_btn.configure(state="disabled")
+        self.robot.force_ready(done_callback=lambda: self.after(0, self._update_button_states))
 
     def _on_status_change(self, state):
         self.state = state
         text_map = {
-            "connected": "🟠 เชื่อมต่อแล้ว (รอ ACK)",
-            "ready": "🟢 พร้อมทำงาน (Ready)",
-            "waiting_done": "🟠 รอหุ่นยนต์ทำงานเสร็จ (Wait State - รอ 'Done')",
-            "disconnected": "🔴 ยังไม่ได้เชื่อมต่อ",
+            "connected": "เชื่อมต่อแล้ว (ยังไม่ได้รับ ACK)",
+            "ready": "พร้อมทำงาน (Ready)",
+            "waiting_done": "รอหุ่นยนต์ทำงานเสร็จ (Wait State - รอ 'Done')",
+            "wait_timeout": "หมดเวลารอ 'Done' - ยังค้างสถานะรอ กดยกเลิกเพื่อเริ่มรอบใหม่",
+            "disconnected": "ยังไม่ได้เชื่อมต่อ",
         }
         color = ui_theme.STATE_COLORS.get(state, ui_theme.NEUTRAL)
 
         def _apply():
-            self.status_var.set(text_map.get(state, f"สถานะ: {state}"))
+            self.status_var.set("สถานะ: " + text_map.get(state, state))
             self.status_label.configure(fg=color)
             self.status_dot.itemconfig(self._status_dot_id, fill=color)
+            self._update_button_states()
 
         self.after(0, _apply)
-        self.after(0, self._update_detect_btn_state)
 
-    def _update_detect_btn_state(self):
-        can_detect = (
-            self.model is not None
-            and self.robot.connected
-            and self.state == "ready"
-        )
+    def _update_button_states(self):
+        can_detect = self.model is not None and self.robot.connected and self.state == "ready"
         self.detect_btn.configure(state="normal" if can_detect else "disabled")
+        can_cancel = self.state in ("waiting_done", "wait_timeout")
+        self.cancel_wait_btn.configure(state="normal" if can_cancel else "disabled")
 
-    # ------------------------------------------------------------ detect ---
-    def _on_key_s(self, event):
-        # กรณีไม่มีการพัฒนา UI เฉพาะ ให้ปุ่ม "S" บนแป้นพิมพ์เป็นปุ่มเริ่มตรวจจับ (Start Detection)
+    # -------------------------------------------------------------- detect ---
+    def _on_detect_key(self, event):
+        """Keyboard shortcut. bind_all sees every keystroke in the application, so
+        typing an "s" into the IP field or the class name box must not start a
+        detection - hence the check on which widget currently has focus."""
+        if isinstance(event.widget, TEXT_INPUT_WIDGETS):
+            return
         if str(self.detect_btn["state"]) == "normal":
             self.on_detect_pressed()
 
@@ -311,19 +392,21 @@ class InferTab(ttk.Frame):
                 parts.append(cname)
                 parts.append(str(cnt))
             result_string = ",".join(parts)
+            readable = "  ".join(f"{cname} = {cnt}" for cname, cnt in counts.items())
         else:
             result_string = "none"
+            readable = "ไม่พบวัตถุ"
 
-        self.result_var.set(f"ผลการตรวจจับล่าสุด: {result_string}")
+        self.result_var.set(f"ผลการตรวจจับล่าสุด: {readable}   |   ส่ง: {result_string}")
         self._log(f"[SYS] ผลการตรวจจับ (Inference): {result_string}")
 
         self.robot.send_detection_result(result_string, wait_for_done_callback=self._after_done)
 
     def _after_done(self, success, message):
         self.after(0, lambda: self._log(f"[SYS] {message}"))
-        self.after(0, self._update_detect_btn_state)
+        self.after(0, self._update_button_states)
 
-    # ------------------------------------------------------------------ log ---
+    # ----------------------------------------------------------------- log ---
     def _log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)

@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 camera_utils.py
------------------
-ฟังก์ชันช่วยตรวจสอบว่ามีกล้อง (webcam) ต่ออยู่กี่ตัว และ index เท่าไรบ้าง
-เพื่อให้ผู้ใช้เลือกกล้องภายนอก (USB Webcam) แทนกล้อง Built-in ของโน้ตบุ๊กได้
+---------------
+Helper for finding out which webcam indices actually work on this machine, so the
+operator can pick the external USB camera instead of the laptop's built-in one.
 
-หมายเหตุ: โดยทั่วไป index 0 มักจะเป็นกล้อง Built-in ของโน้ตบุ๊กเสมอ
-ถ้าต่อกล้อง USB เพิ่ม มักจะไปโผล่ที่ index 1, 2, ... ให้ลองเลือกดูทีละตัว
+Index 0 is almost always the built-in camera. A USB camera usually shows up at index
+1 or higher, so try them one by one.
+
+Note: a camera can only be opened by one process at a time. If the main application
+has a preview running, this scan finds nothing - close the preview first.
 """
 
 import cv2
 
 
 def list_available_cameras(max_index=6):
-    """ลองเปิดกล้องตั้งแต่ index 0 ถึง max_index-1 คืนค่าเป็น list ของ index ที่เปิดได้จริง"""
+    """Try to open every index from 0 to max_index-1 and return those that deliver a frame."""
     available = []
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
