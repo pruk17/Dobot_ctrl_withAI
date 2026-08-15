@@ -38,24 +38,25 @@ import cv2
 
 import dataset_utils as du
 
-# Values chosen for this competition: symbol plates can be placed at any angle on the
-# tray, so rotation is on; hue is randomised widely so the model judges by shape and
-# not by colour. Change them from the augmentation dialog in the training tab.
+# Balanced defaults for a small competition-day dataset.  They add substantially
+# more variation than the conservative preset, without pushing colour/scale as hard
+# as the original aggressive preset.  Horizontal mirroring is still enabled only
+# for classes explicitly marked as safe, because arrows and text can change meaning.
 DEFAULT_CONFIG = {
-    "flip_allowed": {},        # class name -> bool. Missing classes default to True.
+    "flip_allowed": {},        # class name -> bool. Missing/new classes default to False.
     "offline_gray": False,     # also train on a grayscale copy of every image
     "offline_blur": False,     # also train on a blurred copy of every image
     "blur_strength": 3,        # Gaussian kernel size, odd, 3 to 7
     "online": {
         "degrees": 180.0,      # random rotation, plus/minus this many degrees
-        "fliplr": 0.5,         # probability of a left-right flip
-        "flipud": 0.5,         # probability of an up-down flip
-        "hsv_h": 0.5,          # hue shift, 0.5 covers the whole colour wheel
-        "hsv_s": 0.9,          # saturation change, high values approach grayscale
-        "hsv_v": 0.4,          # brightness change
-        "scale": 0.5,          # random zoom in and out
+        "fliplr": 0.5,         # applied only when every class in an image allows mirroring
+        "flipud": 0.5,         # useful for symmetric shape classes and varied placement
+        "hsv_h": 0.2,          # moderate colour variation
+        "hsv_s": 0.5,          # moderate saturation variation
+        "hsv_v": 0.3,          # room-light variation
+        "scale": 0.3,          # moderate camera-distance variation
         "translate": 0.1,      # random shift
-        "mosaic": 1.0,         # stitch four images into one
+        "mosaic": 0.8,         # strong enough to help a small dataset, not on every sample
     },
 }
 
@@ -64,21 +65,21 @@ ONLINE_FIELDS = [
     ("degrees", "หมุนภาพสุ่ม", "องศา", 0.0, 180.0, 5.0,
      "แผ่นสัญลักษณ์ถูกวางมุมไหนก็ได้บนถาด ค่า 180 ครอบคลุมทุกมุม"),
     ("fliplr", "พลิกซ้ายขวา", "โอกาส 0-1", 0.0, 1.0, 0.1,
-     "ใช้ได้เมื่อทุกคลาสอนุญาตให้พลิก ถ้ามีคลาสที่ห้าม โปรแกรมจะบังคับเป็น 0 ให้เอง"),
+     "ค่ากลาง 0.5 ใช้เฉพาะคลาสที่ติ๊กว่าอนุญาต ห้ามติ๊กกับลูกศร/ตัวอักษรที่กลับด้านแล้วเปลี่ยนความหมาย"),
     ("flipud", "พลิกบนล่าง", "โอกาส 0-1", 0.0, 1.0, 0.1,
-     "กล้องมองจากด้านบน แผ่นอาจถูกวางกลับหัวได้"),
+     "ค่ากลาง 0.5 เพิ่มความหลากหลาย เหมาะกับรูปทรงสมมาตร; ลดเป็น 0 หากการกลับด้านเปลี่ยนความหมาย"),
     ("hsv_h", "เปลี่ยนเฉดสี", "0-1", 0.0, 1.0, 0.05,
-     "สุ่มเปลี่ยนสีของภาพ ทำให้โมเดลเลิกใช้สีเป็นตัวตัดสิน ใช้แทน grayscale ได้"),
+     "ค่ากลาง 0.2 เพิ่มความทนต่อสีและสมดุลแสง; ลดลงหากสีใช้แยกคลาส"),
     ("hsv_s", "เปลี่ยนความอิ่มสี", "0-1", 0.0, 1.0, 0.05,
-     "ค่าสูงจะได้ภาพที่สีจางจนเกือบขาวดำบ่อยขึ้น"),
+     "ค่ากลาง 0.5 จำลองความต่างของกล้องและสภาพแสง"),
     ("hsv_v", "เปลี่ยนความสว่าง", "0-1", 0.0, 1.0, 0.05,
      "รับมือกับแสงในห้องแข่งที่ต่างจากห้องซ้อม"),
     ("scale", "ย่อขยายภาพ", "0-1", 0.0, 1.0, 0.1,
-     "รับมือกับระยะระหว่างกล้องกับชิ้นงานที่เปลี่ยนไป"),
+     "ค่ากลาง 0.3 รับมือระยะกล้องและขนาดวัตถุที่เปลี่ยนไป"),
     ("translate", "เลื่อนตำแหน่ง", "0-1", 0.0, 1.0, 0.05,
      "รับมือกับชิ้นงานที่วางไม่ตรงกลางเฟรม"),
     ("mosaic", "ต่อ 4 ภาพเป็นภาพเดียว", "โอกาส 0-1", 0.0, 1.0, 0.1,
-     "ช่วยมากเมื่อมีภาพน้อย ระบบจะปิดให้เองใน 10 epoch สุดท้าย"),
+     "ค่า 0.8 ช่วยชุดข้อมูลหน้างานที่มีน้อย แต่ยังเหลือภาพปกติให้โมเดลเรียนรู้"),
 ]
 
 
@@ -97,9 +98,12 @@ def load_config():
                 cfg["online"].update(value)
             elif key in cfg:
                 cfg[key] = value
-    # Every current class needs an entry; new classes default to "flip allowed".
-    for name in du.load_classes():
-        cfg["flip_allowed"].setdefault(name, True)
+    # Keep only current classes. Unknown/new classes default to "do not mirror";
+    # the operator can explicitly allow safe symmetric classes in the dialog.
+    saved_flip = cfg.get("flip_allowed", {})
+    cfg["flip_allowed"] = {
+        name: bool(saved_flip.get(name, False)) for name in du.load_classes()
+    }
     return cfg
 
 
@@ -249,9 +253,9 @@ def build_offline_augmentations(cfg, log=None):
                 _write_label(new_lbl, rows)
                 counts["blur"] += 1
 
-    made = [f"{v} ภาพ ({k})" for k, v in counts.items() if v]
+    made = [f"{v} images ({k})" for k, v in counts.items() if v]
     if made:
-        _log("สร้างภาพเพิ่มแบบ offline: " + ", ".join(made))
+        _log("[AUG] Offline augmentation generated: " + ", ".join(made))
     return counts
 
 
@@ -274,15 +278,15 @@ def describe(cfg):
     """One line summary written to the training log, so the run is reproducible."""
     mode = flip_mode(cfg)
     mode_text = {
-        "online": "พลิกซ้ายขวาโดย YOLO ทุก epoch",
-        "offline": "พลิกซ้ายขวาแบบสร้างไฟล์ เฉพาะภาพที่ทุกคลาสอนุญาต",
-        "none": "ไม่พลิกซ้ายขวาเลย",
+        "online": "horizontal flip by YOLO on each epoch",
+        "offline": "offline horizontal flip for safe classes only",
+        "none": "horizontal flip disabled",
     }[mode]
     online = ", ".join(f"{k}={v}" for k, v in sorted(cfg["online"].items()))
     extra = []
     if cfg.get("offline_gray"):
-        extra.append("ขาวดำ")
+        extra.append("grayscale")
     if cfg.get("offline_blur"):
-        extra.append(f"เบลอ k={cfg.get('blur_strength', 3)}")
-    extra_text = (" | สำเนาเพิ่ม: " + ", ".join(extra)) if extra else ""
+        extra.append(f"blur k={cfg.get('blur_strength', 3)}")
+    extra_text = (" | offline copies: " + ", ".join(extra)) if extra else ""
     return f"{mode_text}{extra_text} | {online}"

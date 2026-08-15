@@ -60,7 +60,9 @@ class AugmentDialog(tk.Toplevel):
 
         btn_row = ttk.Frame(self)
         btn_row.pack(side="bottom", fill="x", padx=16, pady=(6, 14))
-        ttk.Button(btn_row, text="คืนค่าที่แนะนำ", command=self.reset_defaults).pack(side="left")
+        ttk.Button(
+            btn_row, text="คืนค่าที่แนะนำ", command=self.reset_defaults
+        ).pack(side="left")
         ttk.Button(btn_row, text="บันทึก", style="Accent.TButton", command=self.save).pack(side="right")
         ttk.Button(btn_row, text="ยกเลิก", command=self.destroy).pack(side="right", padx=6)
 
@@ -72,7 +74,8 @@ class AugmentDialog(tk.Toplevel):
             box,
             text=(
                 "ติ๊กไว้ = อนุญาตให้พลิกภาพของคลาสนั้นเป็นภาพกระจก "
-                "ให้เอาติ๊กออกเฉพาะคลาสที่พลิกแล้วกลายเป็นหน้าตาของอีกคลาสหนึ่ง "
+                "ค่าเริ่มต้นจะไม่ติ๊กเพื่อความปลอดภัย ให้ติ๊กเฉพาะเมื่อเห็นสัญลักษณ์จริงแล้วมั่นใจ "
+                "ว่าภาพสะท้อนไม่เปลี่ยนความหมาย เช่น อย่าติ๊กเมื่อมีคลาสที่เป็นลูกศรหรือตัวอักษร "
                 "เช่น ถ้ามีทั้ง arrow_left และ arrow_right หรือมีทั้งตัว b และตัว d "
                 "ส่วนรูปทรงสมมาตรอย่างวงกลม สี่เหลี่ยม ดาว ติ๊กไว้ได้ตามปกติ"
             ),
@@ -89,7 +92,7 @@ class AugmentDialog(tk.Toplevel):
         grid = ttk.Frame(box)
         grid.pack(fill="x", padx=12, pady=(0, 10))
         for i, name in enumerate(classes):
-            var = tk.BooleanVar(value=self.cfg["flip_allowed"].get(name, True))
+            var = tk.BooleanVar(value=self.cfg["flip_allowed"].get(name, False))
             self.flip_vars[name] = var
             cb = ttk.Checkbutton(grid, text=name, variable=var, command=self._update_flip_hint)
             cb.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 24), pady=2)
@@ -192,7 +195,7 @@ class AugmentDialog(tk.Toplevel):
         for key, var in self.online_vars.items():
             var.set(au.DEFAULT_CONFIG["online"][key])
         for var in self.flip_vars.values():
-            var.set(True)
+            var.set(False)
         self.gray_var.set(au.DEFAULT_CONFIG["offline_gray"])
         self.blur_var.set(au.DEFAULT_CONFIG["offline_blur"])
         self.blur_strength_var.set(au.DEFAULT_CONFIG["blur_strength"])

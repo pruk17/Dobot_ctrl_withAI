@@ -75,6 +75,7 @@ class MainApp(tk.Tk):
 
     def on_close(self):
         for closer in (
+            lambda: self.train_tab.save_current_labels(silent=True) if self.train_tab.labels_dirty else None,
             lambda: self.train_tab.stop_preview(),
             lambda: self.infer_tab.stop_preview(),
             lambda: self.infer_tab.robot.close(),

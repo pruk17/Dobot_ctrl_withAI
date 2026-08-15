@@ -139,7 +139,7 @@ class RobotClient:
                 chunk = self.sock.recv(4096)
             except socket.timeout:
                 continue
-            except OSError as e:
+            except (OSError, AttributeError) as e:
                 text = self._flush_buffer()
                 if text:
                     return "ok", text
@@ -192,13 +192,13 @@ class RobotClient:
             self.sock = None
             self.connected = False
             self.status_callback("disconnected")
-            self._log("ERR", f"เชื่อมต่อล้มเหลว: {e}")
+            self._log("ERR", f"Connection failed: {e}")
             return False, str(e)
 
         self.connected = True
         self._buffer = b""
         self._abort_wait = False
-        self._log("SYS", f"เชื่อมต่อสำเร็จไปยัง {ip}:{port}")
+        self._log("SYS", f"Connected to {ip}:{port}")
         self.status_callback("connected")
         return self._handshake()
 
@@ -210,7 +210,7 @@ class RobotClient:
             except Exception as e:
                 self.connected = False
                 self.status_callback("disconnected")
-                self._log("ERR", f"ส่ง Ready ไม่สำเร็จ: {e}")
+                self._log("ERR", f"Failed to send Ready: {e}")
                 return False, str(e)
 
             status, data = self._recv_line(self.ack_timeout)
@@ -219,26 +219,26 @@ class RobotClient:
                 self._log("RECV", data)
                 if data == "ACK":
                     self.status_callback("ready")
-                    self._log("SYS", "ได้รับ ACK จากหุ่นยนต์ -- พร้อมทำงาน")
+                    self._log("SYS", "ACK received from robot -- ready")
                     return True, "เชื่อมต่อและ handshake สำเร็จ (ได้รับ ACK)"
-                self._log("SYS", f"ข้อความไม่ตรงกับ ACK ('{data}') -- ส่ง Ready ซ้ำ (ครั้งที่ {attempt + 1})")
+                self._log("SYS", f"Expected ACK, received '{data}' -- resending Ready (attempt {attempt + 1})")
             elif status == "timeout":
-                self._log("SYS", f"ไม่ได้รับ ACK ใน {self.ack_timeout:.0f} วินาที -- ส่ง Ready ซ้ำ (ครั้งที่ {attempt + 1})")
+                self._log("SYS", f"ACK timeout after {self.ack_timeout:.0f}s -- resending Ready (attempt {attempt + 1})")
             elif status == "closed":
                 self.connected = False
                 self.status_callback("disconnected")
-                self._log("ERR", "หุ่นยนต์ปิดการเชื่อมต่อระหว่าง handshake")
+                self._log("ERR", "Robot closed the connection during handshake")
                 return False, "หุ่นยนต์ปิดการเชื่อมต่อระหว่าง handshake"
             else:
                 self.connected = False
                 self.status_callback("disconnected")
-                self._log("ERR", f"ข้อผิดพลาดระหว่าง handshake: {data}")
+                self._log("ERR", f"Handshake error: {data}")
                 return False, data
 
         self.status_callback("connected")
-        msg = f"ส่ง Ready ครบ {self.ready_retries} ครั้งแล้วยังไม่ได้รับ ACK"
-        self._log("ERR", msg)
-        return False, msg
+        log_msg = f"No ACK received after {self.ready_retries} Ready attempts"
+        self._log("ERR", log_msg)
+        return False, f"ส่ง Ready ครบ {self.ready_retries} ครั้งแล้วยังไม่ได้รับ ACK"
 
     # ---------------------------------------------------------------- detect ---
     def send_detection_result(self, result_string, wait_for_done_callback=None):
@@ -260,13 +260,13 @@ class RobotClient:
                 except Exception as e:
                     self.connected = False
                     self.status_callback("disconnected")
-                    self._log("ERR", f"ส่งผลตรวจจับไม่สำเร็จ: {e}")
+                    self._log("ERR", f"Failed to send detection result: {e}")
                     if wait_for_done_callback:
                         wait_for_done_callback(False, str(e))
                     return
 
                 self.status_callback("waiting_done")
-                self._log("SYS", f"เข้าสถานะรอ (Wait State) รอ Done ไม่เกิน {self.done_timeout:.0f} วินาที")
+                self._log("SYS", f"Entering wait state; waiting up to {self.done_timeout:.0f}s for Done")
 
                 deadline = time.time() + self.done_timeout
                 while True:
@@ -281,40 +281,40 @@ class RobotClient:
                         if data == "Done":
                             self.status_callback("ready")
                             if wait_for_done_callback:
-                                wait_for_done_callback(True, "หุ่นยนต์ทำงานเสร็จแล้ว (Done) -- พร้อมตรวจจับรอบถัดไป")
+                                wait_for_done_callback(True, "Robot completed the task (Done) -- ready for next detection")
                             return
                         # Anything that is not "Done" is chatter. Keep waiting for the
                         # real confirmation instead of ending the round early.
-                        self._log("SYS", f"ข้ามข้อความที่ไม่ใช่ Done ('{data}') และรอต่อ")
+                        self._log("SYS", f"Ignoring non-Done message '{data}' and continuing to wait")
                         continue
 
                     if status == "timeout":
                         self.status_callback("wait_timeout")
-                        msg = (
-                            f"หมดเวลารอ Done ({self.done_timeout:.0f} วินาที) "
-                            "-- ยังค้างสถานะรอ กรุณาตรวจสอบหุ่นยนต์ แล้วกดปุ่มยกเลิกการรอถ้าต้องการเริ่มรอบใหม่"
+                        log_msg = (
+                            f"Done timeout after {self.done_timeout:.0f}s -- still in wait state; "
+                            "check the robot or cancel the wait to start a new cycle"
                         )
-                        self._log("ERR", msg)
+                        self._log("ERR", log_msg)
                         if wait_for_done_callback:
-                            wait_for_done_callback(False, msg)
+                            wait_for_done_callback(False, log_msg)
                         return
 
                     if status == "aborted":
                         if wait_for_done_callback:
-                            wait_for_done_callback(False, "ยกเลิกการรอ Done โดยผู้ใช้")
+                            wait_for_done_callback(False, "Waiting for Done was cancelled by the user")
                         return
 
                     if status == "closed":
                         self.connected = False
                         self.status_callback("disconnected")
-                        self._log("ERR", "หุ่นยนต์ปิดการเชื่อมต่อระหว่างรอ Done")
+                        self._log("ERR", "Robot closed the connection while waiting for Done")
                         if wait_for_done_callback:
-                            wait_for_done_callback(False, "หุ่นยนต์ปิดการเชื่อมต่อระหว่างรอ Done")
+                            wait_for_done_callback(False, "Robot closed the connection while waiting for Done")
                         return
 
                     self.connected = False
                     self.status_callback("disconnected")
-                    self._log("ERR", f"ข้อผิดพลาดระหว่างรอ Done: {data}")
+                    self._log("ERR", f"Error while waiting for Done: {data}")
                     if wait_for_done_callback:
                         wait_for_done_callback(False, data)
                     return
@@ -322,22 +322,17 @@ class RobotClient:
         threading.Thread(target=_worker, daemon=True).start()
 
     def force_ready(self, done_callback=None):
-        """Operator override: stop waiting for "Done" and go back to ready.
+        """Compatibility override: abort the wait and disconnect safely.
 
-        Runs in its own thread because it has to wait for the waiting worker to notice
-        the abort flag and release the lock. Everything still queued on the socket is
-        discarded, otherwise a late "Done" would answer the next detection.
+        A drain cannot protect against a Done that arrives later, so recovering on the
+        same socket is unsafe. The caller must reconnect and perform Ready/ACK again.
         """
         def _worker():
             self._abort_wait = True
             with self.lock:
-                self._drain()
-                self._abort_wait = False
-                if self.connected:
-                    self.status_callback("ready")
-                    self._log("SYS", "ยกเลิกการรอ Done -- ล้างข้อมูลค้างในสายแล้ว พร้อมตรวจจับรอบถัดไป")
-                else:
-                    self.status_callback("disconnected")
+                self.close_silently()
+                self.status_callback("disconnected")
+                self._log("SYS", "Done wait cancelled -- disconnected to prevent a stale Done from crossing cycles")
             if done_callback:
                 done_callback()
 
@@ -362,4 +357,4 @@ class RobotClient:
         self._abort_wait = False
         self.status_callback("disconnected")
         if was_open:
-            self._log("SYS", "ปิดการเชื่อมต่อ")
+            self._log("SYS", "Connection closed")

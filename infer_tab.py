@@ -34,6 +34,29 @@ RIGHT_COLUMN_WIDTH = 560
 TEXT_INPUT_WIDGETS = (tk.Entry, tk.Text, tk.Spinbox, tk.Listbox, ttk.Entry, ttk.Combobox, ttk.Spinbox)
 
 
+def format_detection_result(names, class_ids):
+    """Return deterministic protocol/readable strings ordered by model class id."""
+    counts = {}
+    for raw_id in class_ids:
+        cid = int(raw_id)
+        counts[cid] = counts.get(cid, 0) + 1
+    if not counts:
+        return "none", "ไม่พบวัตถุ"
+
+    parts = []
+    readable = []
+    for cid in sorted(counts):
+        cname = names[cid] if not isinstance(names, dict) else names.get(cid, str(cid))
+        cname = str(cname)
+        if not du.is_valid_class_name(cname):
+            raise ValueError(
+                f"ชื่อคลาส '{cname}' ใช้ส่ง TCP ไม่ได้ ต้องใช้เฉพาะ A-Z, a-z, 0-9 และ _"
+            )
+        parts.extend((cname, str(counts[cid])))
+        readable.append(f"{cname} = {counts[cid]}")
+    return ",".join(parts), "  ".join(readable)
+
+
 class InferTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -44,6 +67,11 @@ class InferTab(ttk.Frame):
         self.model_path = None
         self.state = "disconnected"  # disconnected | connected | ready | waiting_done | wait_timeout
         self._last_frame = None
+        # Annotated snapshot from the most recent detection.  The camera continues
+        # to be read in the background so the next cycle still uses a fresh frame,
+        # while this image remains visible until the operator starts that cycle.
+        self._detection_frame = None
+        self.inference_running = False
 
         self.robot = RobotClient(
             log_callback=self._log_threadsafe,
@@ -198,7 +226,7 @@ class InferTab(ttk.Frame):
         self.status_label.pack(side="left", padx=(0, 10), pady=8)
 
         self.cancel_wait_btn = ttk.Button(
-            right, text="ยกเลิกการรอ Done และกลับสู่สถานะพร้อม", style="Warn.TButton",
+            right, text="ยกเลิกการรอ Done และตัดการเชื่อมต่อ", style="Warn.TButton",
             command=self.cancel_wait, state="disabled"
         )
         self.cancel_wait_btn.pack(side="top", fill="x", padx=10, pady=(0, 8))
@@ -228,14 +256,14 @@ class InferTab(ttk.Frame):
             self.model = YOLO(path)
             self.model_path = path
             self.model_label_var.set(f"โมเดล: {os.path.basename(path)}")
-            self._log(f"[SYS] โหลดโมเดลสำเร็จ: {path}")
+            self._log(f"[SYS] Model loaded successfully: {path}")
             self._update_button_states()
         except Exception as e:
             messagebox.showerror("ผิดพลาด", f"โหลดโมเดลไม่สำเร็จ: {e}")
 
     # ------------------------------------------------------------- camera ---
     def refresh_cameras(self):
-        self._log("[SYS] กำลังค้นหากล้องที่เชื่อมต่อ ... (ใช้เวลาราว 10-30 วินาที)")
+        self._log("[SYS] Scanning connected cameras... (may take 10-30 seconds)")
         self.update_idletasks()
         found = camera_utils.list_available_cameras()
         if not found:
@@ -250,7 +278,7 @@ class InferTab(ttk.Frame):
         self.camera_combo["values"] = values
         # Highest index first: that is usually the external USB camera, which the rules require.
         self.camera_index_var.set(values[-1])
-        self._log(f"[SYS] พบกล้อง index: {values} (เลือก {values[-1]} ให้อัตโนมัติ)")
+        self._log(f"[SYS] Camera indexes found: {values} (auto-selected {values[-1]})")
 
     def start_preview(self):
         if self.preview_running:
@@ -262,6 +290,7 @@ class InferTab(ttk.Frame):
                 "ผิดพลาด", f"ไม่สามารถเปิดกล้อง (index {idx}) ได้ กรุณากด 'ค้นหากล้อง' แล้วเลือก index ใหม่"
             )
             return
+        self._detection_frame = None
         self.preview_running = True
         self._update_preview()
 
@@ -272,6 +301,20 @@ class InferTab(ttk.Frame):
             self.cap = None
         self.preview_label.configure(image="")
         self.preview_label.imgtk = None
+        self._last_frame = None
+        self._detection_frame = None
+        self._update_button_states()
+
+    def _render_preview_frame(self, frame):
+        """Render one OpenCV BGR frame inside the fixed preview area."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        size = ui_theme.fit_size(
+            w, h, self.preview_frame.winfo_width(), self.preview_frame.winfo_height()
+        )
+        imgtk = ImageTk.PhotoImage(image=Image.fromarray(rgb).resize(size))
+        self.preview_label.imgtk = imgtk
+        self.preview_label.configure(image=imgtk)
 
     def _update_preview(self):
         if not self.preview_running or self.cap is None:
@@ -279,14 +322,8 @@ class InferTab(ttk.Frame):
         ok, frame = self.cap.read()
         if ok:
             self._last_frame = frame
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-            size = ui_theme.fit_size(
-                w, h, self.preview_frame.winfo_width(), self.preview_frame.winfo_height()
-            )
-            imgtk = ImageTk.PhotoImage(image=Image.fromarray(rgb).resize(size))
-            self.preview_label.imgtk = imgtk
-            self.preview_label.configure(image=imgtk)
+            shown_frame = self._detection_frame if self._detection_frame is not None else frame
+            self._render_preview_frame(shown_frame)
         self.after(30, self._update_preview)
 
     # ----------------------------------------------------------------- TCP ---
@@ -323,10 +360,11 @@ class InferTab(ttk.Frame):
         self._update_button_states()
 
     def cancel_wait(self):
-        """Operator override after a Done timeout: drop anything still queued on the
-        socket and go back to the ready state."""
+        """Drop the connection so a late Done can never leak into the next round."""
         self.cancel_wait_btn.configure(state="disabled")
-        self.robot.force_ready(done_callback=lambda: self.after(0, self._update_button_states))
+        self.robot.close()
+        self._log("[SYS] Wait cancelled. Reconnect and complete Ready/ACK before the next cycle.")
+        self._update_button_states()
 
     def _on_status_change(self, state):
         self.state = state
@@ -348,7 +386,10 @@ class InferTab(ttk.Frame):
         self.after(0, _apply)
 
     def _update_button_states(self):
-        can_detect = self.model is not None and self.robot.connected and self.state == "ready"
+        can_detect = (
+            self.model is not None and self._last_frame is not None and not self.inference_running
+            and self.robot.connected and self.state == "ready"
+        )
         self.detect_btn.configure(state="normal" if can_detect else "disabled")
         can_cancel = self.state in ("waiting_done", "wait_timeout")
         self.cancel_wait_btn.configure(state="normal" if can_cancel else "disabled")
@@ -375,31 +416,53 @@ class InferTab(ttk.Frame):
             return
 
         frame = self._last_frame.copy()
-        self.detect_btn.configure(state="disabled")
-
         conf = float(self.conf_var.get())
-        results = self.model.predict(source=frame, conf=conf, verbose=False)
-        names = results[0].names
-        counts = {}
-        if results[0].boxes is not None:
-            for cls_id in results[0].boxes.cls.tolist():
-                cname = names[int(cls_id)]
-                counts[cname] = counts.get(cname, 0) + 1
+        # Return to the live feed while processing.  The annotated snapshot replaces
+        # it as soon as inference finishes.
+        self._detection_frame = None
+        self._render_preview_frame(frame)
+        self.inference_running = True
+        self._update_button_states()
+        self._log("[SYS] Running inference...")
+        threading.Thread(target=self._infer_worker, args=(frame, conf), daemon=True).start()
 
-        if counts:
-            parts = []
-            for cname, cnt in counts.items():
-                parts.append(cname)
-                parts.append(str(cnt))
-            result_string = ",".join(parts)
-            readable = "  ".join(f"{cname} = {cnt}" for cname, cnt in counts.items())
-        else:
-            result_string = "none"
-            readable = "ไม่พบวัตถุ"
+    def _infer_worker(self, frame, conf):
+        try:
+            results = self.model.predict(source=frame, conf=conf, verbose=False)
+            names = results[0].names
+            class_ids = []
+            if results[0].boxes is not None:
+                class_ids = results[0].boxes.cls.tolist()
+            result_string, readable = format_detection_result(names, class_ids)
+            # Ultralytics plot() draws boxes, class names and confidence scores on
+            # the exact snapshot used for inference and returns an OpenCV BGR image.
+            annotated_frame = results[0].plot(labels=True, conf=True)
+            self.after(
+                0,
+                lambda: self._finish_inference(
+                    result_string, readable, annotated_frame, None
+                ),
+            )
+        except Exception as exc:
+            self.after(0, lambda exc=exc: self._finish_inference(None, None, None, str(exc)))
 
+    def _finish_inference(self, result_string, readable, annotated_frame, error):
+        self.inference_running = False
+        if error:
+            self._log(f"[ERR] Inference failed: {error}")
+            messagebox.showerror("Inference ไม่สำเร็จ", error)
+            self._update_button_states()
+            return
+
+        self._detection_frame = annotated_frame
+        self._render_preview_frame(annotated_frame)
         self.result_var.set(f"ผลการตรวจจับล่าสุด: {readable}   |   ส่ง: {result_string}")
-        self._log(f"[SYS] ผลการตรวจจับ (Inference): {result_string}")
-
+        self._log(f"[SYS] Detection result: {result_string}")
+        if not self.robot.connected or self.state != "ready":
+            self._log("[ERR] Connection state changed during inference; result was not sent.")
+            messagebox.showwarning("ไม่ได้ส่งผล", "การเชื่อมต่อไม่พร้อม กรุณาเชื่อมต่อใหม่แล้วตรวจจับอีกครั้ง")
+            self._update_button_states()
+            return
         self.robot.send_detection_result(result_string, wait_for_done_callback=self._after_done)
 
     def _after_done(self, success, message):

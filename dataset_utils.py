@@ -20,7 +20,10 @@ labelling canvas and the names written into data.yaml both come from it.
 
 import os
 import random
+import re
 import shutil
+import uuid
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -42,6 +45,7 @@ AUG_CONFIG = os.path.join(BASE_DIR, "augment.json")
 # rebuilt from scratch before every training run. YOLO still reads them, because it
 # scans the folder itself.
 AUG_MARK = "__aug"
+CLASS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def is_augmented(name):
@@ -91,11 +95,131 @@ def save_classes(classes):
 
 
 def add_class(name):
+    if not is_valid_class_name(name):
+        raise ValueError("class name must contain only A-Z, a-z, 0-9 and underscore")
     classes = load_classes()
     if name not in classes:
         classes.append(name)
         save_classes(classes)
     return classes
+
+
+def is_valid_class_name(name):
+    """Return True when a class name is safe to put in the comma-separated TCP protocol."""
+    return bool(name and CLASS_NAME_PATTERN.fullmatch(name))
+
+
+def unique_image_path(class_name, extension=".jpg"):
+    """Return a collision-resistant destination for a newly captured/imported image."""
+    ensure_dirs()
+    extension = extension.lower() or ".jpg"
+    if not extension.startswith("."):
+        extension = "." + extension
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
+    return os.path.join(IMAGES_TRAIN, f"{class_name}_{stamp}{extension}")
+
+
+def delete_dataset_image(image_path):
+    """Delete one original image, its label, and augmentation copies derived from it.
+
+    The path must belong to the managed train/val image folders. Generated variants
+    use ``<original-base>__aug...`` so they can be removed without touching any other
+    photograph in the dataset.
+    """
+    image_path = os.path.abspath(image_path)
+    folder = os.path.dirname(image_path)
+    folder_map = {
+        os.path.abspath(IMAGES_TRAIN): os.path.abspath(LABELS_TRAIN),
+        os.path.abspath(IMAGES_VAL): os.path.abspath(LABELS_VAL),
+    }
+    if folder not in folder_map or is_augmented(image_path):
+        raise ValueError("ลบได้เฉพาะภาพต้นฉบับใน Dataset เท่านั้น")
+
+    label_folder = folder_map[folder]
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    targets = {image_path, os.path.join(label_folder, base + ".txt")}
+    augmented_prefix = base + AUG_MARK
+    for target_folder in (folder, label_folder):
+        if not os.path.isdir(target_folder):
+            continue
+        for name in os.listdir(target_folder):
+            if name.startswith(augmented_prefix):
+                targets.add(os.path.join(target_folder, name))
+
+    removed = 0
+    for target in targets:
+        if os.path.isfile(target):
+            os.remove(target)
+            removed += 1
+    return removed
+
+
+def import_labeled_yolo_dataset(source_root):
+    """Import a YOLO dataset and remap its class ids to the current classes.
+
+    Both flat ``images/`` + ``labels/`` folders and nested train/val folders are
+    accepted. A classes.txt file is required because copying numeric ids without
+    knowing their source ordering can silently corrupt every label.
+    """
+    images_root = os.path.join(source_root, "images")
+    labels_root = os.path.join(source_root, "labels")
+    classes_path = os.path.join(source_root, "classes.txt")
+    if not os.path.isdir(images_root) or not os.path.isdir(labels_root):
+        raise ValueError("โฟลเดอร์ที่เลือกต้องมี images/ และ labels/")
+    if not os.path.isfile(classes_path):
+        raise ValueError("ไม่พบ classes.txt จึงไม่สามารถตรวจและแปลง class id ได้อย่างปลอดภัย")
+
+    with open(classes_path, "r", encoding="utf-8") as f:
+        incoming = [line.strip() for line in f if line.strip()]
+    if not incoming or len(set(incoming)) != len(incoming):
+        raise ValueError("classes.txt ว่างหรือมีชื่อคลาสซ้ำ")
+    invalid = [name for name in incoming if not is_valid_class_name(name)]
+    if invalid:
+        raise ValueError("ชื่อคลาสไม่ถูกต้อง: " + ", ".join(invalid))
+
+    existing = load_classes()
+    merged = existing + [name for name in incoming if name not in existing]
+    id_map = {old_id: merged.index(name) for old_id, name in enumerate(incoming)}
+    prepared = []
+    valid_exts = (".jpg", ".jpeg", ".png", ".bmp")
+    for folder, _, filenames in os.walk(images_root):
+        for filename in filenames:
+            if not filename.lower().endswith(valid_exts):
+                continue
+            src_image = os.path.join(folder, filename)
+            relative = os.path.relpath(src_image, images_root)
+            src_label = os.path.join(labels_root, os.path.splitext(relative)[0] + ".txt")
+            if not os.path.isfile(src_label):
+                raise ValueError(f"ไม่พบ Label ของภาพ: {relative}")
+            remapped = []
+            with open(src_label, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    parts = line.split()
+                    if len(parts) != 5:
+                        raise ValueError(f"Label ผิดรูปแบบ: {relative} บรรทัด {line_no}")
+                    try:
+                        old_id = int(parts[0])
+                        coords = [float(value) for value in parts[1:]]
+                    except ValueError as exc:
+                        raise ValueError(f"Label ผิดรูปแบบ: {relative} บรรทัด {line_no}") from exc
+                    if old_id not in id_map:
+                        raise ValueError(f"class id เกิน classes.txt: {relative} บรรทัด {line_no}")
+                    remapped.append((id_map[old_id], coords))
+            if not remapped:
+                raise ValueError(f"Label ว่าง: {relative}")
+            prepared.append((src_image, os.path.splitext(filename)[1], remapped))
+
+    if not prepared:
+        raise ValueError("ไม่พบรูปภาพในชุดข้อมูล")
+    save_classes(merged)
+    for src_image, extension, rows in prepared:
+        destination = unique_image_path("imported", extension)
+        shutil.copy2(src_image, destination)
+        label_destination = label_path_for_image(destination)
+        with open(label_destination, "w", encoding="utf-8") as f:
+            for class_id, coords in rows:
+                f.write(f"{class_id} " + " ".join(f"{value:.6f}" for value in coords) + "\n")
+    return len(prepared), merged
 
 
 def list_images(folder, include_augmented=False):
@@ -192,3 +316,95 @@ def write_data_yaml():
     with open(DATA_YAML, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
     return DATA_YAML
+
+
+def validate_dataset(min_images=5, require_validation=True):
+    """Validate the original (non-augmented) dataset before an expensive train run.
+
+    Returns ``(errors, warnings, stats)``. Empty label files are treated as errors for
+    this competition because every captured image is expected to contain a symbol.
+    """
+    ensure_dirs()
+    classes = load_classes()
+    errors = []
+    warnings = []
+    stats = {"classes": len(classes), "train": 0, "val": 0, "boxes": 0}
+    # Labels are saved to six decimals. A box exactly on an image edge can therefore
+    # round outward by half of the final decimal place without actually being invalid.
+    coordinate_tolerance = 1e-6
+
+    if not classes:
+        errors.append("ยังไม่มีคลาส")
+    invalid_names = [name for name in classes if not is_valid_class_name(name)]
+    if invalid_names:
+        errors.append("ชื่อคลาสใช้กับ TCP ไม่ปลอดภัย: " + ", ".join(invalid_names))
+
+    for split, image_dir in (("train", IMAGES_TRAIN), ("val", IMAGES_VAL)):
+        paths = [os.path.join(image_dir, name) for name in list_images(image_dir)]
+        stats[split] = len(paths)
+        for image_path in paths:
+            label_path = label_path_for_image(image_path)
+            display = os.path.basename(image_path)
+            if read_image(image_path) is None:
+                errors.append(f"อ่านรูปไม่ได้: {display}")
+                continue
+            if not os.path.exists(label_path) or os.path.getsize(label_path) == 0:
+                errors.append(f"ยังไม่มี Label: {display}")
+                continue
+
+            valid_rows = 0
+            with open(label_path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    parts = line.split()
+                    try:
+                        cid = int(parts[0])
+                        values = [float(value) for value in parts[1:]]
+                    except (IndexError, ValueError):
+                        errors.append(f"Label ผิดรูปแบบ: {os.path.basename(label_path)} บรรทัด {line_no}")
+                        continue
+                    if len(parts) != 5 or len(values) != 4:
+                        errors.append(f"Label ผิดรูปแบบ: {os.path.basename(label_path)} บรรทัด {line_no}")
+                        continue
+                    cx, cy, bw, bh = values
+                    if not 0 <= cid < len(classes):
+                        errors.append(f"class id ไม่ถูกต้อง: {os.path.basename(label_path)} บรรทัด {line_no}")
+                        continue
+                    box_inside_image = (
+                        -coordinate_tolerance <= cx - bw / 2
+                        and cx + bw / 2 <= 1 + coordinate_tolerance
+                        and -coordinate_tolerance <= cy - bh / 2
+                        and cy + bh / 2 <= 1 + coordinate_tolerance
+                    )
+                    if not (
+                        0 <= cx <= 1 and 0 <= cy <= 1 and 0 < bw <= 1 and 0 < bh <= 1
+                        and box_inside_image
+                    ):
+                        errors.append(f"พิกัดกรอบไม่ถูกต้อง: {os.path.basename(label_path)} บรรทัด {line_no}")
+                        continue
+                    valid_rows += 1
+            stats["boxes"] += valid_rows
+
+    total = stats["train"] + stats["val"]
+    if total < min_images:
+        errors.append(f"มีรูปเพียง {total} ภาพ (ต้องมีอย่างน้อย {min_images} ภาพ)")
+    if require_validation and stats["val"] == 0:
+        errors.append("ยังไม่มี Validation set กรุณากดแบ่งชุด Train/Val ก่อน")
+    if stats["val"] == 1:
+        warnings.append("Validation มีเพียง 1 ภาพ ค่าความแม่นยำอาจไม่น่าเชื่อถือ")
+    return errors, warnings, stats
+
+
+def backup_and_reset_dataset():
+    """Move the complete dataset aside and recreate an empty competition dataset."""
+    ensure_dirs()
+    backup_root = os.path.join(os.path.dirname(BASE_DIR), "dataset_backups")
+    os.makedirs(backup_root, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_root, f"dataset_{stamp}")
+    suffix = 1
+    while os.path.exists(backup_path):
+        backup_path = os.path.join(backup_root, f"dataset_{stamp}_{suffix}")
+        suffix += 1
+    shutil.move(BASE_DIR, backup_path)
+    ensure_dirs()
+    return backup_path

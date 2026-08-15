@@ -36,6 +36,77 @@ from augment_dialog import AugmentDialog
 LEFT_COLUMN_WIDTH = 430
 
 
+def class_index_for_shortcut(key, class_count):
+    """Map keyboard keys 1-9 to a zero-based class index, or None."""
+    if len(key) == 1 and key in "123456789":
+        index = int(key) - 1
+        if index < class_count:
+            return index
+    return None
+
+
+class BoxClassDialog(tk.Toplevel):
+    """Small modal picker shown after a new bounding box has been drawn."""
+
+    def __init__(self, master, classes, initial_class="", x=None, y=None):
+        super().__init__(master)
+        self.result = None
+        self.classes = classes
+        self.initial_class = initial_class if initial_class in classes else classes[0]
+        self.title("เลือกคลาสของกรอบ")
+        self.configure(bg=ui_theme.BG)
+        self.resizable(False, False)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        ttk.Label(self, text="กรอบนี้คือคลาสอะไร?", style="Header.TLabel").pack(
+            anchor="w", padx=14, pady=(12, 4)
+        )
+        ttk.Label(
+            self, text="กดเลข 1–9 เพื่อเลือก · Enter = คลาสล่าสุด · Esc = ยกเลิก",
+            style="Sub.TLabel",
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        grid = ttk.Frame(self)
+        grid.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        for index, name in enumerate(classes):
+            shortcut = f"{index + 1}. " if index < 9 else ""
+            style = "Accent.TButton" if name == self.initial_class else "TButton"
+            ttk.Button(
+                grid, text=shortcut + name, style=style,
+                command=lambda selected=name: self._choose(selected),
+            ).grid(row=index // 3, column=index % 3, sticky="ew", padx=3, pady=3)
+        for column in range(min(3, len(classes))):
+            grid.columnconfigure(column, weight=1)
+
+        self.bind("<KeyPress>", self._on_key)
+        self.grab_set()
+        self.update_idletasks()
+        px = self.winfo_pointerx() if x is None else x
+        py = self.winfo_pointery() if y is None else y
+        px = min(max(0, px + 8), max(0, self.winfo_screenwidth() - self.winfo_reqwidth()))
+        py = min(max(0, py + 8), max(0, self.winfo_screenheight() - self.winfo_reqheight()))
+        self.geometry(f"+{px}+{py}")
+        self.focus_force()
+
+    def _on_key(self, event):
+        index = class_index_for_shortcut(event.char, len(self.classes))
+        if index is not None:
+            self._choose(self.classes[index])
+        elif event.keysym in ("Return", "KP_Enter"):
+            self._choose(self.initial_class)
+        elif event.keysym == "Escape":
+            self._cancel()
+
+    def _choose(self, class_name):
+        self.result = class_name
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class TrainTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -47,6 +118,7 @@ class TrainTab(ttk.Frame):
         self.current_label_image_path = None
         self.current_label_cv_img = None
         self.current_boxes = []  # (class_id, x1, y1, x2, y2) in original image pixels
+        self.labels_dirty = False
         self.draw_start = None
         self.canvas_scale = 1.0
         self.canvas_offset = (0, 0)
@@ -96,6 +168,10 @@ class TrainTab(ttk.Frame):
         ttk.Button(
             left, text="นำเข้าชุดข้อมูลที่ติดป้ายแล้ว (YOLO)", command=self.import_labeled_dataset
         ).pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        ttk.Button(
+            left, text="เริ่ม Dataset ใหม่ (สำรองชุดเดิม)", style="Danger.TButton",
+            command=self.reset_dataset,
+        ).pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         ttk.Button(left, text="นำเข้ารูปภาพจากไฟล์", command=self.import_images).pack(
             side="bottom", fill="x", padx=10, pady=(2, 4)
         )
@@ -121,11 +197,9 @@ class TrainTab(ttk.Frame):
         ttk.Button(
             left, text="ถ่ายภาพ (บันทึกเข้าชุดข้อมูล)", style="Accent.TButton", command=self.capture_image
         ).pack(side="bottom", fill="x", padx=10, pady=(0, 10))
-
-        self.capture_class_var = tk.StringVar()
-        self.capture_class_combo = ttk.Combobox(left, textvariable=self.capture_class_var, state="readonly")
-        self.capture_class_combo.pack(side="bottom", fill="x", padx=10, pady=(2, 8))
-        ttk.Label(left, text="คลาสที่จะบันทึกเมื่อถ่ายภาพ:").pack(side="bottom", anchor="w", padx=10)
+        ttk.Label(
+            left, text="ถ่ายภาพก่อน แล้วกำหนดหลายคลาสได้ตอนวาดกรอบ", style="Sub.TLabel"
+        ).pack(side="bottom", anchor="w", padx=10, pady=(0, 6))
 
         cam_btns = ttk.Frame(left)
         cam_btns.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
@@ -150,21 +224,39 @@ class TrainTab(ttk.Frame):
     def _build_labeling_panel(self, right):
         control_row = ttk.Frame(right)
         control_row.pack(side="top", fill="x", padx=10, pady=10)
-        ttk.Label(control_row, text="คลาสสำหรับวาดกรอบ:").pack(side="left")
+        ttk.Label(control_row, text="คลาสล่าสุด (Enter ใน popup):").pack(side="left")
         self.label_class_var = tk.StringVar()
         self.label_class_combo = ttk.Combobox(
             control_row, textvariable=self.label_class_var, state="readonly", width=15
         )
         self.label_class_combo.pack(side="left", padx=6)
 
-        ttk.Button(control_row, text="ก่อนหน้า", command=self.prev_unlabeled).pack(side="left", padx=3)
-        ttk.Button(control_row, text="ถัดไป", command=self.next_unlabeled).pack(side="left", padx=3)
         ttk.Button(
             control_row, text="ลบกรอบที่เลือก", style="Danger.TButton", command=self.delete_selected_box
         ).pack(side="left", padx=3)
         ttk.Button(
             control_row, text="บันทึก Label", style="Accent.TButton", command=self.save_current_labels
         ).pack(side="left", padx=3)
+
+        ttk.Label(
+            right,
+            text="ลากวาดกรอบก่อน แล้วเลือกคลาสจาก popup ด้วยเมาส์หรือปุ่มเลข 1–9",
+            style="Sub.TLabel",
+        ).pack(side="top", anchor="w", padx=10, pady=(0, 4))
+
+        nav_row = ttk.Frame(right)
+        nav_row.pack(side="top", fill="x", padx=10, pady=(0, 6))
+        ttk.Button(nav_row, text="ก่อนหน้า", command=self.prev_unlabeled).pack(side="left", padx=(0, 4))
+        self.image_selector_var = tk.StringVar()
+        self.image_selector = ttk.Combobox(
+            nav_row, textvariable=self.image_selector_var, state="readonly", width=42
+        )
+        self.image_selector.pack(side="left", fill="x", expand=True, padx=4)
+        self.image_selector.bind("<<ComboboxSelected>>", self._on_image_selected)
+        ttk.Button(nav_row, text="ถัดไป", command=self.next_unlabeled).pack(side="left", padx=4)
+        ttk.Button(
+            nav_row, text="ลบภาพนี้", style="Danger.TButton", command=self.delete_current_image
+        ).pack(side="left", padx=(4, 0))
 
         self.label_status_var = tk.StringVar(value="ยังไม่มีรูปภาพให้ติดป้ายกำกับ")
         ttk.Label(right, textvariable=self.label_status_var, style="Sub.TLabel").pack(
@@ -227,7 +319,7 @@ class TrainTab(ttk.Frame):
 
     # ------------------------------------------------------------- camera ---
     def refresh_cameras(self):
-        self._log("[SYS] กำลังค้นหากล้องที่เชื่อมต่อ ... (ใช้เวลาราว 10-30 วินาที)")
+        self._log("[SYS] Scanning connected cameras... (may take 10-30 seconds)")
         self.update_idletasks()
         found = camera_utils.list_available_cameras()
         if not found:
@@ -243,7 +335,7 @@ class TrainTab(ttk.Frame):
         # The highest index is picked automatically because it is usually the external
         # USB camera; the competition rules forbid the built-in one, which is index 0.
         self.camera_index_var.set(values[-1])
-        self._log(f"[SYS] พบกล้อง index: {values} (เลือก {values[-1]} ให้อัตโนมัติ)")
+        self._log(f"[SYS] Camera indexes found: {values} (auto-selected {values[-1]})")
 
     def start_preview(self):
         if self.preview_running:
@@ -289,21 +381,13 @@ class TrainTab(ttk.Frame):
         if self._last_frame is None:
             messagebox.showwarning("แจ้งเตือน", "ยังไม่มีภาพจากกล้อง")
             return
-        cls = self.capture_class_var.get()
-        if not cls:
-            messagebox.showwarning(
-                "แจ้งเตือน",
-                "ยังไม่ได้เลือกคลาสที่จะบันทึก\n\n"
-                "ถ้ายังไม่มีคลาสเลย ให้พิมพ์ชื่อคลาสในช่องด้านล่าง (เช่น circle) "
-                "แล้วกด 'เพิ่มคลาส' ก่อน",
-            )
-            return
         du.ensure_dirs()
-        idx = len(du.list_images(du.IMAGES_TRAIN)) + len(du.list_images(du.IMAGES_VAL))
-        fname = f"{cls}_{idx:05d}.jpg"
-        path = os.path.join(du.IMAGES_TRAIN, fname)
-        du.save_image(path, self._last_frame)
-        self._log(f"บันทึกภาพ: {fname} (คลาส: {cls}) -- ยังไม่ได้ติดป้ายกำกับ")
+        path = du.unique_image_path("capture", ".jpg")
+        fname = os.path.basename(path)
+        if not du.save_image(path, self._last_frame):
+            messagebox.showerror("ผิดพลาด", "บันทึกภาพไม่สำเร็จ")
+            return
+        self._log(f"[DATA] Image saved: {fname} -- not labeled yet")
         self._refresh_unlabeled_list()
 
     # ------------------------------------------------------------ classes ---
@@ -312,28 +396,29 @@ class TrainTab(ttk.Frame):
         self.class_listbox.delete(0, tk.END)
         for c in classes:
             self.class_listbox.insert(tk.END, c)
-        self.capture_class_combo["values"] = classes
         self.label_class_combo["values"] = classes
-        if classes and not self.capture_class_var.get():
-            self.capture_class_var.set(classes[0])
         if classes and not self.label_class_var.get():
             self.label_class_var.set(classes[0])
+        if not classes:
+            self.label_class_var.set("")
 
     def add_class(self):
         name = self.new_class_var.get().strip()
         if not name:
             return
+        if not du.is_valid_class_name(name):
+            messagebox.showwarning(
+                "ชื่อคลาสไม่ถูกต้อง",
+                "ใช้เฉพาะตัวอักษรอังกฤษ A-Z, a-z ตัวเลข และ _ เท่านั้น\nเช่น circle หรือ arrow_left",
+            )
+            return
         du.add_class(name)
         self.new_class_var.set("")
         self._refresh_class_list()
-        self._log(f"เพิ่มคลาสใหม่: {name}")
+        self._log(f"[DATA] Class added: {name}")
 
     # ------------------------------------------------------------- import ---
     def import_images(self):
-        cls = self.capture_class_var.get()
-        if not cls:
-            messagebox.showwarning("แจ้งเตือน", "กรุณาเลือก/เพิ่มคลาสก่อนนำเข้ารูปภาพ")
-            return
         files = filedialog.askopenfilenames(
             title="เลือกไฟล์รูปภาพ", filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")]
         )
@@ -342,10 +427,9 @@ class TrainTab(ttk.Frame):
         du.ensure_dirs()
         for f in files:
             ext = os.path.splitext(f)[1]
-            idx = len(du.list_images(du.IMAGES_TRAIN)) + len(du.list_images(du.IMAGES_VAL))
-            dest = os.path.join(du.IMAGES_TRAIN, f"{cls}_{idx:05d}{ext}")
+            dest = du.unique_image_path("imported", ext)
             shutil.copy(f, dest)
-        self._log(f"นำเข้ารูปภาพ {len(files)} ไฟล์ (คลาส: {cls})")
+        self._log(f"[DATA] Imported {len(files)} images -- assign classes while drawing boxes")
         self._refresh_unlabeled_list()
 
     def import_labeled_dataset(self):
@@ -353,35 +437,12 @@ class TrainTab(ttk.Frame):
         folder = filedialog.askdirectory(title="เลือกโฟลเดอร์ dataset (ต้องมีโฟลเดอร์ images และ labels)")
         if not folder:
             return
-        images_src = os.path.join(folder, "images")
-        labels_src = os.path.join(folder, "labels")
-        classes_src = os.path.join(folder, "classes.txt")
-        if not os.path.isdir(images_src) or not os.path.isdir(labels_src):
-            messagebox.showerror("ผิดพลาด", "โฟลเดอร์ที่เลือกต้องมี images/ และ labels/ อยู่ภายใน")
+        try:
+            count, _ = du.import_labeled_yolo_dataset(folder)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("นำเข้าไม่สำเร็จ", str(exc))
             return
-        du.ensure_dirs()
-        if os.path.exists(classes_src):
-            with open(classes_src, "r", encoding="utf-8") as f:
-                incoming = [line.strip() for line in f if line.strip()]
-            existing = du.load_classes()
-            for c in incoming:
-                if c not in existing:
-                    existing.append(c)
-            du.save_classes(existing)
-
-        count = 0
-        for img_name in os.listdir(images_src):
-            if not img_name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                continue
-            base = os.path.splitext(img_name)[0]
-            lbl_name = base + ".txt"
-            src_img = os.path.join(images_src, img_name)
-            src_lbl = os.path.join(labels_src, lbl_name)
-            shutil.copy(src_img, os.path.join(du.IMAGES_TRAIN, img_name))
-            if os.path.exists(src_lbl):
-                shutil.copy(src_lbl, os.path.join(du.LABELS_TRAIN, lbl_name))
-            count += 1
-        self._log(f"นำเข้าชุดข้อมูลที่ติดป้ายแล้วจำนวน {count} ภาพ")
+        self._log(f"[DATA] Imported labeled dataset: {count} images")
         self._refresh_class_list()
         self._refresh_unlabeled_list()
 
@@ -389,16 +450,50 @@ class TrainTab(ttk.Frame):
     def _refresh_unlabeled_list(self):
         self.unlabeled_paths = du.unlabeled_images()
         self.all_paths = du.all_images()
-        self.label_status_var.set(
-            f"รูปภาพทั้งหมด {len(self.all_paths)} ภาพ | ยังไม่ติดป้าย {len(self.unlabeled_paths)} ภาพ"
-        )
+        self.image_path_by_name = {
+            self._image_display_name(path): path for path in self.all_paths
+        }
+        self.image_selector["values"] = list(self.image_path_by_name)
+        if self.current_label_image_path not in self.all_paths:
+            self.current_label_image_path = None
         if self.all_paths and self.current_label_image_path is None:
             self._load_image_for_labeling(self.all_paths[0])
+        elif not self.all_paths:
+            self.current_label_cv_img = None
+            self.current_boxes = []
+            self.labels_dirty = False
+            self.image_selector_var.set("")
+            self.canvas.delete("all")
+        self._update_label_status()
+
+    def _image_display_name(self, path):
+        split = os.path.basename(os.path.dirname(path))
+        return f"{split}/{os.path.basename(path)}"
+
+    def _update_label_status(self):
+        current = ""
+        if self.current_label_image_path in self.all_paths:
+            index = self.all_paths.index(self.current_label_image_path) + 1
+            current = f" | ภาพที่ {index}/{len(self.all_paths)}"
+            self.image_selector_var.set(self._image_display_name(self.current_label_image_path))
+        self.label_status_var.set(
+            f"รูปภาพทั้งหมด {len(self.all_paths)} ภาพ | ยังไม่ติดป้าย {len(self.unlabeled_paths)} ภาพ{current}"
+        )
+
+    def _on_image_selected(self, _event=None):
+        path = self.image_path_by_name.get(self.image_selector_var.get())
+        if not path or path == self.current_label_image_path:
+            return
+        if self.labels_dirty:
+            self.save_current_labels(silent=True)
+            self._log("[DATA] Labels auto-saved before changing image")
+        self._load_image_for_labeling(path)
 
     def _load_image_for_labeling(self, path):
         self.current_label_image_path = path
         self.current_label_cv_img = du.read_image(path)
         self.current_boxes = []
+        self.labels_dirty = False
         lbl_path = du.label_path_for_image(path)
         classes = du.load_classes()
         if self.current_label_cv_img is not None and os.path.exists(lbl_path) and classes:
@@ -415,6 +510,7 @@ class TrainTab(ttk.Frame):
                     y2 = (cy + bh / 2) * h
                     self.current_boxes.append((cid, x1, y1, x2, y2))
         self._render_canvas()
+        self._update_label_status()
 
     def _on_canvas_resize(self, event):
         # Re-render only when the size really changed, otherwise every drag event
@@ -467,12 +563,11 @@ class TrainTab(ttk.Frame):
             self.draw_start = None
             return
         classes = du.load_classes()
-        cls_name = self.label_class_var.get()
-        if not cls_name:
-            messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกคลาสสำหรับวาดกรอบก่อน")
+        if not classes:
+            messagebox.showwarning("ยังไม่มีคลาส", "กรุณาเพิ่มคลาสอย่างน้อย 1 คลาสก่อนติดป้ายกำกับ")
             self.draw_start = None
+            self._render_canvas()
             return
-        cid = classes.index(cls_name)
 
         ox, oy = self.canvas_offset
         scale = self.canvas_scale or 1.0
@@ -489,7 +584,16 @@ class TrainTab(ttk.Frame):
         iy0, iy1 = max(0, min(iy0, h)), max(0, min(iy1, h))
 
         if abs(ix1 - ix0) > 4 and abs(iy1 - iy0) > 4:
-            self.current_boxes.append((cid, ix0, iy0, ix1, iy1))
+            dialog = BoxClassDialog(
+                self.winfo_toplevel(), classes, self.label_class_var.get(), event.x_root, event.y_root
+            )
+            self.wait_window(dialog)
+            cls_name = dialog.result
+            if cls_name is not None:
+                cid = classes.index(cls_name)
+                self.label_class_var.set(cls_name)
+                self.current_boxes.append((cid, ix0, iy0, ix1, iy1))
+                self.labels_dirty = True
         self.draw_start = None
         self._render_canvas()
 
@@ -500,9 +604,10 @@ class TrainTab(ttk.Frame):
         idx = sel[0]
         if 0 <= idx < len(self.current_boxes):
             del self.current_boxes[idx]
+            self.labels_dirty = True
         self._render_canvas()
 
-    def save_current_labels(self):
+    def save_current_labels(self, silent=False):
         if not self.current_label_image_path or self.current_label_cv_img is None:
             return
         h, w = self.current_label_cv_img.shape[:2]
@@ -515,12 +620,17 @@ class TrainTab(ttk.Frame):
                 bw = abs(x2 - x1) / w
                 bh = abs(y2 - y1) / h
                 f.write(f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-        self._log(f"บันทึก label: {os.path.basename(lbl_path)} ({len(self.current_boxes)} กรอบ)")
+        self.labels_dirty = False
+        if not silent:
+            self._log(f"[DATA] Labels saved: {os.path.basename(lbl_path)} ({len(self.current_boxes)} boxes)")
         self._refresh_unlabeled_list()
 
     def _step_image(self, step):
         if not self.all_paths:
             return
+        if self.labels_dirty:
+            self.save_current_labels(silent=True)
+            self._log("[DATA] Labels auto-saved before changing image")
         try:
             idx = self.all_paths.index(self.current_label_image_path)
         except ValueError:
@@ -534,50 +644,92 @@ class TrainTab(ttk.Frame):
     def prev_unlabeled(self):
         self._step_image(-1)
 
+    def delete_current_image(self):
+        path = self.current_label_image_path
+        if not path:
+            return
+        if str(self.train_btn["state"]) == "disabled":
+            messagebox.showwarning("กำลังฝึกสอน", "ไม่สามารถลบภาพระหว่างฝึกสอนได้")
+            return
+        if not messagebox.askyesno(
+            "ลบภาพออกจาก Dataset",
+            f"ต้องการลบ {os.path.basename(path)} หรือไม่?\n"
+            "Label และภาพ augmentation ที่สร้างจากภาพนี้จะถูกลบด้วย",
+        ):
+            return
+        old_index = self.all_paths.index(path) if path in self.all_paths else 0
+        try:
+            removed = du.delete_dataset_image(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("ลบภาพไม่สำเร็จ", str(exc))
+            return
+        self.current_label_image_path = None
+        self.current_label_cv_img = None
+        self.current_boxes = []
+        self.labels_dirty = False
+        self._refresh_unlabeled_list()
+        if self.all_paths:
+            self._load_image_for_labeling(self.all_paths[min(old_index, len(self.all_paths) - 1)])
+        self._log(f"[DATA] Deleted image and {removed} related files: {os.path.basename(path)}")
+
     # ----------------------------------------------------------- training ---
     def open_augment_dialog(self):
         AugmentDialog(self.winfo_toplevel(), on_saved=self._on_augment_saved)
 
     def _on_augment_saved(self, cfg):
-        self._log("บันทึกการตั้งค่าเพิ่มข้อมูลแล้ว: " + au.describe(cfg))
+        self._log("[AUG] Augmentation settings saved: " + au.describe(cfg))
 
     def split_dataset(self):
+        if str(self.train_btn["state"]) == "disabled":
+            messagebox.showwarning("กำลังฝึกสอน", "รอให้การฝึกสอนเสร็จก่อนแบ่ง Dataset ใหม่")
+            return
+        if self.labels_dirty:
+            self.save_current_labels(silent=True)
         # Generated files are dropped first, otherwise the re-split would scatter them
         # into the validation set and the reported accuracy would be measured on
         # pictures derived from the training images.
         removed = au.clear_augmented()
         n_train, n_val = du.rebalance_train_val(val_ratio=0.2)
         if removed:
-            self._log(f"ลบภาพที่สร้างเพิ่มไว้เดิม {removed} ไฟล์")
-        self._log(f"แบ่งชุดข้อมูลใหม่: train={n_train} ภาพ, val={n_val} ภาพ")
+            self._log(f"[AUG] Removed {removed} previously generated files")
+        self._log(f"[DATA] Dataset split completed: train={n_train} images, val={n_val} images")
         self.current_label_image_path = None
         self._refresh_unlabeled_list()
 
     def start_training(self):
-        classes = du.load_classes()
-        if not classes:
-            messagebox.showwarning("แจ้งเตือน", "กรุณาเพิ่มคลาสอย่างน้อย 1 คลาสก่อนฝึกสอน")
+        if self.labels_dirty:
+            self.save_current_labels(silent=True)
+        errors, warnings, stats = du.validate_dataset(min_images=5, require_validation=True)
+        if errors:
+            shown = errors[:12]
+            more = f"\n...และอีก {len(errors) - len(shown)} รายการ" if len(errors) > len(shown) else ""
+            messagebox.showerror("Dataset ยังไม่พร้อมฝึกสอน", "\n".join(shown) + more)
             return
-        if len(du.all_images()) < 5:
-            messagebox.showwarning("แจ้งเตือน", "ควรมีรูปภาพที่ติดป้ายกำกับแล้วอย่างน้อยหลายภาพก่อนฝึกสอน")
+        if warnings and not messagebox.askyesno(
+            "คำเตือน Dataset", "\n".join(warnings) + "\n\nต้องการฝึกสอนต่อหรือไม่?"
+        ):
+            return
         du.write_data_yaml()
+        options = (self.model_size_var.get(), self.epochs_var.get(), self.imgsz_var.get())
+        self._log(
+            f"[DATA] Dataset validation passed: train={stats['train']}, val={stats['val']}, "
+            f"classes={stats['classes']}, boxes={stats['boxes']}"
+        )
         self.train_btn.configure(state="disabled")
-        threading.Thread(target=self._train_worker, daemon=True).start()
+        threading.Thread(target=self._train_worker, args=(options,), daemon=True).start()
 
-    def _train_worker(self):
+    def _train_worker(self, options):
         """Runs in a worker thread. Tk is not thread safe, so every UI call goes
         through self.after(0, ...) to run on the main loop instead."""
         try:
             from ultralytics import YOLO
         except ImportError:
-            self._log_threadsafe("ERROR: ไม่พบไลบรารี ultralytics กรุณาติดตั้งด้วย: pip install ultralytics")
+            self._log_threadsafe("[ERR] Ultralytics is not installed. Run: pip install ultralytics")
             self.after(0, lambda: self.train_btn.configure(state="normal"))
             return
 
-        model_choice = self.model_size_var.get()
+        model_choice, epochs, imgsz = options
         base_model = model_choice.split(" ")[0]  # drop the Thai description after the filename
-        epochs = self.epochs_var.get()
-        imgsz = self.imgsz_var.get()
 
         # Rebuild the offline variants from scratch so a changed setting takes effect
         # and old copies from a previous run cannot pile up.
@@ -586,9 +738,9 @@ class TrainTab(ttk.Frame):
         au.build_offline_augmentations(cfg, log=self._log_threadsafe)
         aug_params = au.online_params(cfg)
 
-        self._log_threadsafe(f"เริ่มฝึกสอนโมเดล: base={base_model}, epochs={epochs}, imgsz={imgsz}")
-        self._log_threadsafe("การเพิ่มข้อมูล: " + au.describe(cfg))
-        self._log_threadsafe("ความคืบหน้าแบบละเอียดจะแสดงในหน้าต่าง Terminal ที่รันโปรแกรม")
+        self._log_threadsafe(f"[TRAIN] Starting training: base={base_model}, epochs={epochs}, imgsz={imgsz}")
+        self._log_threadsafe("[AUG] Augmentation: " + au.describe(cfg))
+        self._log_threadsafe("[TRAIN] Detailed progress is shown in the application terminal")
         try:
             model = YOLO(base_model)
             model.train(
@@ -600,11 +752,11 @@ class TrainTab(ttk.Frame):
             if os.path.exists(best_path):
                 du.ensure_dirs()
                 shutil.copy(best_path, du.MODEL_PATH)
-                self._log_threadsafe(f"ฝึกสอนเสร็จสิ้น! บันทึกโมเดลไว้ที่: {du.MODEL_PATH}")
+                self._log_threadsafe(f"[TRAIN] Training completed. Best model saved to: {du.MODEL_PATH}")
             else:
-                self._log_threadsafe("ฝึกสอนเสร็จสิ้น แต่ไม่พบไฟล์ best.pt (โปรดตรวจสอบ log ใน Terminal)")
+                self._log_threadsafe("[ERR] Training finished but best.pt was not found. Check the terminal log.")
         except Exception as e:
-            self._log_threadsafe(f"เกิดข้อผิดพลาดระหว่างฝึกสอน: {e}")
+            self._log_threadsafe(f"[ERR] Training failed: {e}")
         finally:
             self.after(0, lambda: self.train_btn.configure(state="normal"))
 
@@ -615,3 +767,28 @@ class TrainTab(ttk.Frame):
 
     def _log_threadsafe(self, msg):
         self.after(0, lambda: self._log(msg))
+
+    def reset_dataset(self):
+        if str(self.train_btn["state"]) == "disabled":
+            messagebox.showwarning("กำลังฝึกสอน", "ไม่สามารถเปลี่ยน Dataset ระหว่างฝึกสอนได้")
+            return
+        if not messagebox.askyesno(
+            "เริ่ม Dataset ใหม่",
+            "โปรแกรมจะย้าย Dataset และโมเดลชุดปัจจุบันไปเก็บใน dataset_backups\n"
+            "แล้วสร้าง Dataset ว่างสำหรับการแข่งขัน ต้องการดำเนินการหรือไม่?",
+        ):
+            return
+        if self.labels_dirty:
+            self.save_current_labels(silent=True)
+        self.stop_preview()
+        backup_path = du.backup_and_reset_dataset()
+        self.current_label_image_path = None
+        self.current_label_cv_img = None
+        self.current_boxes = []
+        self.labels_dirty = False
+        self._canvas_imgtk = None
+        self.canvas.delete("all")
+        self._refresh_class_list()
+        self.label_class_var.set("")
+        self._refresh_unlabeled_list()
+        self._log(f"[DATA] New dataset started. Previous dataset backed up to: {backup_path}")
