@@ -466,8 +466,15 @@ class InferTab(ttk.Frame):
         self.robot.send_detection_result(result_string, wait_for_done_callback=self._after_done)
 
     def _after_done(self, success, message):
-        self.after(0, lambda: self._log(f"[SYS] {message}"))
-        self.after(0, self._update_button_states)
+        def _apply():
+            self._log(f"[SYS] {message}")
+            if success:
+                # Robot finished the round: drop the frozen annotated snapshot so the
+                # preview returns to the live feed, ready for the next detection.
+                self._detection_frame = None
+            self._update_button_states()
+
+        self.after(0, _apply)
 
     # ----------------------------------------------------------------- log ---
     def _log(self, msg):
