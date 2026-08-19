@@ -69,7 +69,7 @@ def serve_client(conn, addr, work_seconds):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=29999)
+    parser.add_argument("--port", type=int, default=6001)
     parser.add_argument(
         "--work-seconds", type=float, default=2.0,
         help="how long the fake robot pretends to work before answering Done",

@@ -17,6 +17,7 @@ as the answer to the next detection. The operator clears it with the cancel butt
 
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -32,6 +33,14 @@ RIGHT_COLUMN_WIDTH = 560
 
 # Widget classes where a keystroke means "the user is typing", not "start detection".
 TEXT_INPUT_WIDGETS = (tk.Entry, tk.Text, tk.Spinbox, tk.Listbox, ttk.Entry, ttk.Combobox, ttk.Spinbox)
+
+# A frame older than this is not trusted for a detection. Without this guard the
+# camera can silently stop delivering frames while the last picture stays in memory,
+# and a detection would then report what the camera saw minutes ago.
+CAMERA_STALE_SECONDS = 2.0
+
+# Consecutive failed reads (~1 s at 30 ms per frame) before the camera is reopened.
+CAMERA_RETRY_AFTER = 30
 
 
 def format_detection_result(names, class_ids):
@@ -72,6 +81,13 @@ class InferTab(ttk.Frame):
         # while this image remains visible until the operator starts that cycle.
         self._detection_frame = None
         self.inference_running = False
+        # Camera health. _last_frame_time is when _last_frame was actually captured,
+        # which is what makes a stale picture detectable at all.
+        self._camera_index = None
+        self._last_frame_time = 0.0
+        self._read_failures = 0
+        self._camera_reopened = False
+        self._frame_was_fresh = False
 
         self.robot = RobotClient(
             log_callback=self._log_threadsafe,
@@ -143,11 +159,17 @@ class InferTab(ttk.Frame):
             bg=ui_theme.CARD_BG, fg=ui_theme.ACCENT_DARK, anchor="w", justify="left",
         ).pack(anchor="w", padx=10, pady=8)
 
+        # Packed before the detect button so it ends up directly underneath it.
+        self.reset_view_btn = ttk.Button(
+            left, text="รีเซ็ตภาพ (กลับไปแสดงภาพสด)", command=self.reset_view, state="disabled"
+        )
+        self.reset_view_btn.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+
         self.detect_btn = ttk.Button(
             left, text="เริ่มการตรวจจับ (Detect: S)", style="Accent.TButton",
             command=self.on_detect_pressed, state="disabled"
         )
-        self.detect_btn.pack(side="bottom", fill="x", padx=10, pady=(4, 8))
+        self.detect_btn.pack(side="bottom", fill="x", padx=10, pady=(4, 4))
 
         conf_row = ttk.Frame(left)
         conf_row.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
@@ -183,10 +205,8 @@ class InferTab(ttk.Frame):
         self.ip_var = tk.StringVar(value="192.168.1.6")
         ttk.Entry(conn_row, textvariable=self.ip_var, width=16).grid(row=0, column=1, padx=6)
         ttk.Label(conn_row, text="Port:").grid(row=0, column=2, sticky="w", padx=(12, 0))
-        # 29999 matches mock_robot_server.py for local testing. On the real MG400 this
-        # must be the port of the TCP server written in the robot program - 29999 is the
-        # Dobot dashboard port and will never answer "ACK".
-        self.port_var = tk.StringVar(value="29999")
+        # 9000 is the default port for the TCP server written in the robot program.
+        self.port_var = tk.StringVar(value="9000")
         ttk.Entry(conn_row, textvariable=self.port_var, width=8).grid(row=0, column=3, padx=6)
 
         btn_row = ttk.Frame(right)
@@ -280,17 +300,36 @@ class InferTab(ttk.Frame):
         self.camera_index_var.set(values[-1])
         self._log(f"[SYS] Camera indexes found: {values} (auto-selected {values[-1]})")
 
+    def _open_capture(self, idx):
+        """Open a camera, preferring DirectShow.
+
+        OpenCV picks the MSMF backend by default on Windows. On USB webcams it
+        regularly stops delivering frames after a while and only reports
+        "can't grab frame", which leaves the preview frozen. DirectShow is markedly
+        more stable for long sessions, so it is tried first and MSMF is the fallback.
+        """
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            return cap
+        cap.release()
+        return cv2.VideoCapture(idx)
+
     def start_preview(self):
         if self.preview_running:
             return
         idx = int(self.camera_index_var.get())
-        self.cap = cv2.VideoCapture(idx)
+        self.cap = self._open_capture(idx)
         if not self.cap.isOpened():
             messagebox.showerror(
                 "ผิดพลาด", f"ไม่สามารถเปิดกล้อง (index {idx}) ได้ กรุณากด 'ค้นหากล้อง' แล้วเลือก index ใหม่"
             )
             return
+        self._camera_index = idx
         self._detection_frame = None
+        self._read_failures = 0
+        self._camera_reopened = False
+        self._last_frame_time = time.monotonic()
+        self._frame_was_fresh = False
         self.preview_running = True
         self._update_preview()
 
@@ -303,6 +342,9 @@ class InferTab(ttk.Frame):
         self.preview_label.imgtk = None
         self._last_frame = None
         self._detection_frame = None
+        self._read_failures = 0
+        self._camera_reopened = False
+        self._frame_was_fresh = False
         self._update_button_states()
 
     def _render_preview_frame(self, frame):
@@ -316,14 +358,72 @@ class InferTab(ttk.Frame):
         self.preview_label.imgtk = imgtk
         self.preview_label.configure(image=imgtk)
 
+    def _frame_is_fresh(self):
+        """True when the newest captured frame is recent enough to act on."""
+        return (
+            self._last_frame is not None
+            and (time.monotonic() - self._last_frame_time) <= CAMERA_STALE_SECONDS
+        )
+
+    def _handle_camera_stall(self):
+        """The camera stopped delivering frames. Reopen it once, then give up loudly."""
+        if self._camera_reopened:
+            self._log("[ERR] Camera is still silent after reopening. Preview stopped.")
+            self.stop_preview()
+            messagebox.showerror(
+                "กล้องหยุดส่งภาพ",
+                "กล้องหยุดส่งภาพ และเปิดใหม่อัตโนมัติแล้วยังไม่กลับมา\n\n"
+                "ลองถอดสาย USB แล้วเสียบใหม่ จากนั้นกด 'เปิดกล้อง' อีกครั้ง",
+            )
+            return
+
+        self._camera_reopened = True
+        self._read_failures = 0
+        self._log("[SYS] Camera stopped delivering frames. Reopening it once...")
+        if self.cap:
+            self.cap.release()
+        self.cap = self._open_capture(self._camera_index)
+        if not self.cap.isOpened():
+            self._log("[ERR] Reopening the camera failed. Preview stopped.")
+            self.stop_preview()
+            messagebox.showerror(
+                "กล้องหยุดส่งภาพ",
+                "เปิดกล้องใหม่ไม่สำเร็จ ลองถอดสาย USB แล้วเสียบใหม่ จากนั้นกด 'เปิดกล้อง' อีกครั้ง",
+            )
+
     def _update_preview(self):
         if not self.preview_running or self.cap is None:
             return
+
         ok, frame = self.cap.read()
         if ok:
+            if self._read_failures:
+                self._log(f"[SYS] Camera recovered after {self._read_failures} failed reads.")
+            self._read_failures = 0
+            self._camera_reopened = False
             self._last_frame = frame
+            self._last_frame_time = time.monotonic()
             shown_frame = self._detection_frame if self._detection_frame is not None else frame
             self._render_preview_frame(shown_frame)
+        else:
+            self._read_failures += 1
+            if self._read_failures >= CAMERA_RETRY_AFTER:
+                self._handle_camera_stall()
+                if not self.preview_running:
+                    return
+
+        # Only touch the buttons when the picture changes between fresh and stale,
+        # so this is not re-evaluated 33 times a second for nothing.
+        fresh = self._frame_is_fresh()
+        if fresh != self._frame_was_fresh:
+            self._frame_was_fresh = fresh
+            if not fresh:
+                self._log(
+                    "[ERR] ภาพจากกล้องไม่สด -- ปิดปุ่มตรวจจับไว้ชั่วคราว "
+                    "เพื่อไม่ให้ส่งผลจากภาพเก่าไปยังหุ่นยนต์"
+                )
+            self._update_button_states()
+
         self.after(30, self._update_preview)
 
     # ----------------------------------------------------------------- TCP ---
@@ -387,12 +487,45 @@ class InferTab(ttk.Frame):
 
     def _update_button_states(self):
         can_detect = (
-            self.model is not None and self._last_frame is not None and not self.inference_running
+            self.model is not None and self._frame_is_fresh() and not self.inference_running
             and self.robot.connected and self.state == "ready"
         )
         self.detect_btn.configure(state="normal" if can_detect else "disabled")
         can_cancel = self.state in ("waiting_done", "wait_timeout")
         self.cancel_wait_btn.configure(state="normal" if can_cancel else "disabled")
+        # Available whenever a picture is on screen, whether it is frozen or not.
+        self.reset_view_btn.configure(state="normal" if self.preview_running else "disabled")
+
+    def reset_view(self):
+        """Manual reset: live preview back, and detection allowed again.
+
+        This is a different route out of a cycle than receiving "Done". Done means the
+        robot confirmed it finished; a reset means the operator decided to carry on
+        without that confirmation. Both end up in the same ready state, so the log
+        says explicitly which one happened.
+
+        Anything still queued on the socket is discarded on the way, so a "Done" the
+        robot already sent for the abandoned round cannot answer the next one.
+        """
+        self._detection_frame = None
+        self._log("[RESET] Manual reset by operator (not a Done from the robot).")
+        self._log("[RESET] Preview returned to the live camera feed.")
+
+        if self.state in ("waiting_done", "wait_timeout"):
+            self._log("[RESET] Abandoning the wait for Done and clearing the socket buffer...")
+            self.robot.resume_ready(done_callback=lambda: self.after(0, self._after_reset))
+        else:
+            self._update_button_states()
+            self._log("[RESET] Ready for the next detection.")
+
+    def _after_reset(self):
+        self._update_button_states()
+        if str(self.detect_btn["state"]) == "normal":
+            self._log("[RESET] Ready for the next detection.")
+        else:
+            self._log(
+                "[RESET] Preview is live, but detection is still locked -- check the camera feed and the robot connection."
+            )
 
     # -------------------------------------------------------------- detect ---
     def _on_detect_key(self, event):
@@ -410,6 +543,14 @@ class InferTab(ttk.Frame):
             return
         if self._last_frame is None:
             messagebox.showwarning("แจ้งเตือน", "กรุณาเปิดกล้องก่อน")
+            return
+        # Last line of defence: never send a result taken from a picture the camera
+        # stopped refreshing, or the robot would act on what was in front of it before.
+        if not self._frame_is_fresh():
+            messagebox.showwarning(
+                "แจ้งเตือน",
+                "ภาพจากกล้องไม่สด กล้องอาจหยุดส่งภาพ\n\nกรุณากด 'ปิดกล้อง' แล้ว 'เปิดกล้อง' ใหม่ก่อนตรวจจับ",
+            )
             return
         if not self.robot.connected or self.state != "ready":
             messagebox.showwarning("แจ้งเตือน", "ยังไม่พร้อมสื่อสารกับหุ่นยนต์ (ต้องเชื่อมต่อและได้รับ ACK ก่อน)")

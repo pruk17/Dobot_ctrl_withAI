@@ -321,6 +321,35 @@ class RobotClient:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def resume_ready(self, done_callback=None):
+        """Operator override: stop waiting for "Done" and go back to ready on the
+        SAME connection, without a reconnect and without a new Ready/ACK.
+
+        Everything already queued on the socket is discarded first, so a "Done" the
+        robot sent for the abandoned round cannot be read as the answer to the next
+        one. A "Done" that arrives strictly AFTER this call is indistinguishable from
+        a fresh one and would still cross cycles - that residual risk is accepted
+        here on purpose, because the operator asked to carry on rather than
+        reconnect. force_ready() is the strict variant that drops the connection.
+        """
+        def _worker():
+            self._abort_wait = True
+            with self.lock:
+                self._drain()
+                self._abort_wait = False
+                if self.connected:
+                    self.status_callback("ready")
+                    self._log(
+                        "SYS",
+                        "Wait for Done abandoned by the operator -- socket drained, ready for the next detection",
+                    )
+                else:
+                    self.status_callback("disconnected")
+            if done_callback:
+                done_callback()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def force_ready(self, done_callback=None):
         """Compatibility override: abort the wait and disconnect safely.
 

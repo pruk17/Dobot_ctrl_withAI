@@ -12,7 +12,7 @@ function to_text(received)
 end
 
 -- open the port and wait for the AI program
-local error_code, socket = TCPCreate(true, "192.168.1.6", 9000)
+local error_code, socket = TCPCreate(true, "192.168.1.6", 9001)
 print("TCPCreate error_code = " .. tostring(error_code))
 
 if error_code ~= 0 then
@@ -39,7 +39,5 @@ while true do
     end
   end
 
-  -- pick up the AI program again if it disconnected and came back
-  TCPStart(socket, 20)
   Sleep(20)
 end

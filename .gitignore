@@ -5,3 +5,4 @@
 /dataset
 /dataset_backups
 *.pt
+*.zip
